@@ -853,8 +853,14 @@ async fn expand_chapter(
         &context,
     )
     .await?;
-    // Save chapter
+    // Snapshot before overwriting
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
+    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+        let old_text = existing["text"].as_str().unwrap_or("");
+        if !old_text.is_empty() {
+            let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+        }
+    }
     storage::save_json(&project_id, &chapter_file, &result)?;
     Ok(result)
 }
@@ -899,7 +905,14 @@ async fn continue_writing(
 
 #[tauri::command]
 async fn save_chapter(project_id: String, chapter_number: u32, text: String) -> Result<(), String> {
+    // Auto-snapshot before overwriting
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
+    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+        let old_text = existing["text"].as_str().unwrap_or("");
+        if !old_text.is_empty() {
+            let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+        }
+    }
     storage::save_json(&project_id, &chapter_file, &json!({"text": text}))
 }
 
@@ -1368,6 +1381,96 @@ async fn check_consistency(
     engine::check_consistency(&client, &truncate_chars(&summaries_str, 6000), &world_str, &chars_str).await
 }
 
+// ===== Snapshot & Search =====
+
+#[tauri::command]
+async fn list_chapter_snapshots(project_id: String, chapter_number: u32) -> Result<Value, String> {
+    let snapshots = storage::list_snapshots(&project_id, chapter_number)?;
+    Ok(json!(snapshots))
+}
+
+#[tauri::command]
+async fn restore_snapshot(project_id: String, chapter_number: u32, snapshot_file: String) -> Result<Value, String> {
+    // Load snapshot
+    let snap = storage::load_snapshot(&project_id, &snapshot_file)?;
+    let snap_text = snap["text"].as_str().ok_or("快照内容为空")?;
+
+    // Backup current before restoring
+    let chapter_file = format!("chapter_{:03}.json", chapter_number);
+    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+        let old_text = existing["text"].as_str().unwrap_or("");
+        if !old_text.is_empty() {
+            let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+        }
+    }
+
+    // Overwrite with snapshot
+    let restored = json!({"text": snap_text});
+    storage::save_json(&project_id, &chapter_file, &restored)?;
+    Ok(restored)
+}
+
+#[tauri::command]
+async fn search_chapters(project_id: String, query: String) -> Result<Value, String> {
+    if query.is_empty() {
+        return Ok(json!([]));
+    }
+    let query_lower = query.to_lowercase();
+    let plot = storage::load_json(&project_id, "plot.json")?.unwrap_or(json!({}));
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut total_matches = 0u32;
+
+    // Scan all chapter files
+    for num in 1..=500u32 {
+        if total_matches >= 100 { break; }
+        let file = format!("chapter_{:03}.json", num);
+        if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
+            if let Some(text) = ch["text"].as_str() {
+                let text_lower = text.to_lowercase();
+                let mut matches: Vec<Value> = Vec::new();
+                let mut start = 0;
+                while let Some(pos) = text_lower[start..].find(&query_lower) {
+                    let abs_pos = start + pos;
+                    let ctx_start = abs_pos.saturating_sub(30);
+                    let ctx_end = (abs_pos + query.len() + 30).min(text.len());
+                    // Safe char boundaries
+                    let mut cs = ctx_start;
+                    while cs > 0 && !text.is_char_boundary(cs) { cs -= 1; }
+                    let mut ce = ctx_end;
+                    while ce < text.len() && !text.is_char_boundary(ce) { ce += 1; }
+                    matches.push(json!({
+                        "offset": abs_pos,
+                        "context": &text[cs..ce],
+                    }));
+                    total_matches += 1;
+                    if total_matches >= 100 { break; }
+                    start = abs_pos + query.len();
+                }
+                if !matches.is_empty() {
+                    // Find chapter title from plot
+                    let title = plot["acts"].as_array()
+                        .and_then(|acts| acts.iter().find_map(|act| {
+                            act["chapters"].as_array().and_then(|chs| {
+                                chs.iter().find(|c| c["number"].as_u64() == Some(num as u64))
+                                    .and_then(|c| c["title"].as_str())
+                            })
+                        }))
+                        .unwrap_or("");
+                    results.push(json!({
+                        "chapter_number": num,
+                        "title": title,
+                        "matches": matches,
+                    }));
+                }
+            }
+        } else {
+            break; // No more chapters
+        }
+    }
+    Ok(json!(results))
+}
+
 #[tauri::command]
 async fn export_novel(project_id: String, format: String) -> Result<String, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
@@ -1488,6 +1591,9 @@ pub fn run() {
             batch_generate_chapters,
             cancel_batch_generation,
             check_consistency,
+            list_chapter_snapshots,
+            restore_snapshot,
+            search_chapters,
             list_skills,
             install_skill_repo,
             update_skill_repo,

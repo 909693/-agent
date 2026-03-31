@@ -46,6 +46,12 @@ function App() {
     model: localStorage.getItem("llm_model") || "",
     baseUrl: localStorage.getItem("llm_base_url") || "",
   });
+  const [theme, setTheme] = useState(localStorage.getItem("retl_theme") || "light");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("retl_theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     api.listProjects().then(setProjects).catch(console.error);
@@ -166,7 +172,7 @@ function App() {
             />
           )}
           {page === "settings" && (
-            <SettingsPage llm={llm} onChange={setLlm} />
+            <SettingsPage llm={llm} onChange={setLlm} theme={theme} onThemeChange={setTheme} />
           )}
           {page === "chat" && (
             <ChatCreator

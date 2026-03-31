@@ -168,6 +168,16 @@ export const api = {
   checkConsistency: (projectId: string, llm: LlmParams) =>
     invoke<any>("check_consistency", { projectId, ...llmArgs(llm) }),
 
+  // Snapshots
+  listChapterSnapshots: (projectId: string, chapterNumber: number) =>
+    invoke<any>("list_chapter_snapshots", { projectId, chapterNumber }),
+  restoreSnapshot: (projectId: string, chapterNumber: number, snapshotFile: string) =>
+    invoke<any>("restore_snapshot", { projectId, chapterNumber, snapshotFile }),
+
+  // Search
+  searchChapters: (projectId: string, query: string) =>
+    invoke<any>("search_chapters", { projectId, query }),
+
   listSkills: () => invoke<SkillRecord[]>("list_skills"),
   installSkillRepo: (repoUrl: string) =>
     invoke<SkillRecord>("install_skill_repo", { repoUrl }),

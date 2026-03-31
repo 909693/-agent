@@ -5,6 +5,8 @@ import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 interface Props {
   llm: LlmParams;
   onChange: (llm: LlmParams) => void;
+  theme: string;
+  onThemeChange: (theme: string) => void;
 }
 
 type Profile = { apiKey: string; model: string; baseUrl: string };
@@ -24,7 +26,7 @@ function saveProfiles(p: Profiles) {
   localStorage.setItem(PROFILES_KEY, JSON.stringify(p));
 }
 
-export function SettingsPage({ llm, onChange }: Props) {
+export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
   const isConfigured = !!(llm.apiKey && llm.model);
   const [dataDir, setDataDir] = useState("");
   const [changing, setChanging] = useState(false);
@@ -87,6 +89,21 @@ export function SettingsPage({ llm, onChange }: Props) {
 
   return (
     <div className="settings-page">
+      <div className="settings-card">
+        <h3>外观设置</h3>
+        <div className="form-group">
+          <label>主题</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className={`btn-outline ${theme === "light" ? "active" : ""}`} onClick={() => onThemeChange("light")}>
+              亮色
+            </button>
+            <button className={`btn-outline ${theme === "dark" ? "active" : ""}`} onClick={() => onThemeChange("dark")}>
+              暗色
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div className="settings-card">
         <h3>LLM 配置</h3>
 

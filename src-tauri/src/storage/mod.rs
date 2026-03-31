@@ -170,3 +170,60 @@ pub fn delete_project(project_id: &str) -> Result<(), String> {
         Err("Project not found".into())
     }
 }
+
+// ===== Snapshot System =====
+
+/// Save a snapshot of the current chapter before overwriting
+pub fn save_snapshot(project_id: &str, chapter_number: u32, text: &str) -> Result<(), String> {
+    let snap_dir = project_dir(project_id).join("snapshots");
+    fs::create_dir_all(&snap_dir).map_err(|e| e.to_string())?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let filename = format!("chapter_{:03}_{}.json", chapter_number, timestamp);
+    let data = serde_json::json!({
+        "text": text,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "word_count": text.len(),
+        "chapter_number": chapter_number,
+    });
+    let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    fs::write(snap_dir.join(filename), content).map_err(|e| e.to_string())
+}
+
+/// List snapshots for a chapter (metadata only, sorted newest first)
+pub fn list_snapshots(project_id: &str, chapter_number: u32) -> Result<Vec<Value>, String> {
+    let snap_dir = project_dir(project_id).join("snapshots");
+    let prefix = format!("chapter_{:03}_", chapter_number);
+    let mut snapshots = Vec::new();
+    if let Ok(entries) = fs::read_dir(&snap_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(".json") {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                        snapshots.push(serde_json::json!({
+                            "file": name,
+                            "timestamp": val["timestamp"],
+                            "word_count": val["word_count"],
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    snapshots.sort_by(|a, b| {
+        let ta = a["timestamp"].as_str().unwrap_or("");
+        let tb = b["timestamp"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
+    Ok(snapshots)
+}
+
+/// Load full snapshot content
+pub fn load_snapshot(project_id: &str, snapshot_file: &str) -> Result<Value, String> {
+    let path = project_dir(project_id).join("snapshots").join(snapshot_file);
+    if !path.exists() {
+        return Err("快照不存在".into());
+    }
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
+}

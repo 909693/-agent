@@ -57,6 +57,8 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [chapterContext, setChapterContext] = useState<any>(null);
   const [showStates, setShowStates] = useState(false);
   const [showForeshadowing, setShowForeshadowing] = useState(false);
+  const [snapshots, setSnapshots] = useState<any[]>([]);
+  const [showSnapshots, setShowSnapshots] = useState(false);
 
   useEffect(() => {
     api.getPlot(projectId).then((plot: any) => {
@@ -212,6 +214,25 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     } catch (e: any) { setError(e.toString()); }
   };
 
+  const loadSnapshots = async () => {
+    try {
+      const list = await api.listChapterSnapshots(projectId, chapterNum);
+      setSnapshots(Array.isArray(list) ? list : []);
+      setShowSnapshots(true);
+    } catch { setSnapshots([]); }
+  };
+
+  const handleRestore = async (file: string) => {
+    if (!confirm("确定恢复此版本？当前内容将被备份后替换。")) return;
+    try {
+      const result: any = await api.restoreSnapshot(projectId, chapterNum, file);
+      setText(result.text || "");
+      prevWordCount.current = (result.text || "").length;
+      setSaved(true);
+      setShowSnapshots(false);
+    } catch (e: any) { setError(e.toString()); }
+  };
+
   const goNext = () => {
     const idx = chapters.findIndex(c => c.number === chapterNum);
     if (idx >= 0 && idx < chapters.length - 1) setChapterNum(chapters[idx + 1].number);
@@ -270,10 +291,32 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           />
           <div className="editor-bottom-bar">
             <button className="save-btn" onClick={handleSave}>保存</button>
+            <button className="btn-outline" onClick={loadSnapshots}>历史版本</button>
             <button className="next-chapter-btn" onClick={() => { handleSave(); goNext(); }}>
               保存并下一章 →
             </button>
           </div>
+          {showSnapshots && (
+            <div className="snapshots-panel">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <h4 style={{ margin: 0 }}>历史版本</h4>
+                <button className="btn-sm" onClick={() => setShowSnapshots(false)}>关闭</button>
+              </div>
+              {snapshots.length === 0 ? (
+                <p className="dim" style={{ fontSize: 13 }}>暂无历史版本</p>
+              ) : (
+                snapshots.map((s: any, i: number) => (
+                  <div key={i} className="snapshot-item">
+                    <div>
+                      <span style={{ fontSize: 13 }}>{new Date(s.timestamp).toLocaleString()}</span>
+                      <span className="dim" style={{ marginLeft: 8, fontSize: 12 }}>{s.word_count} 字</span>
+                    </div>
+                    <button className="btn-sm" onClick={() => handleRestore(s.file)}>恢复</button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
         <div className="editor-panel">
           <CreativeConstraintsPanel />

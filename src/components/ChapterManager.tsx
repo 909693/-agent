@@ -50,6 +50,11 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [consistencyResult, setConsistencyResult] = useState<any>(null);
   const [checkingConsistency, setCheckingConsistency] = useState(false);
 
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<any[] | null>(null);
+  const [searching, setSearching] = useState(false);
+
   useEffect(() => {
     api.getWorld(project.id).then(setWorld).catch(() => setWorld(null));
     api.getCharacters(project.id).then(setCharacters).catch(() => setCharacters(null));
@@ -270,6 +275,16 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setConsistencyResult(result);
     } catch (e: any) { setError(e.toString()); }
     setCheckingConsistency(false);
+  };
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) return;
+    setSearching(true); setError("");
+    try {
+      const results = await api.searchChapters(project.id, searchQuery.trim());
+      setSearchResults(Array.isArray(results) ? results : []);
+    } catch (e: any) { setError(e.toString()); }
+    setSearching(false);
   };
 
   const allChapters: { number: number; title: string; summary: string }[] = [];
@@ -502,6 +517,42 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
             </div>
           ) : (
             <>
+              {/* Search Bar */}
+              <div className="search-bar">
+                <input
+                  type="text"
+                  placeholder="搜索章节内容（角色名、情节关键词...）"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleSearch()}
+                />
+                <button className="btn-primary" onClick={handleSearch} disabled={searching || !searchQuery.trim()}>
+                  {searching ? <><span className="loading-spinner" />搜索中</> : "搜索"}
+                </button>
+              </div>
+              {searchResults && (
+                <div className="search-results">
+                  {searchResults.length === 0 ? (
+                    <p className="dim" style={{ padding: 8 }}>未找到匹配结果</p>
+                  ) : (
+                    searchResults.map((r: any, i: number) => (
+                      <div key={i} className="search-result-chapter">
+                        <div className="search-result-header" onClick={() => onWriteChapter(r.chapter_number)} style={{ cursor: "pointer" }}>
+                          <span className="chapter-ref">第{r.chapter_number}章</span>
+                          <span>{r.title}</span>
+                          <span className="dim">（{r.matches?.length} 处匹配）</span>
+                        </div>
+                        {r.matches?.slice(0, 3).map((m: any, j: number) => (
+                          <div key={j} className="search-result-context">
+                            ...{m.context}...
+                          </div>
+                        ))}
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
               {/* Batch Generation Panel */}
               <div className="batch-panel">
                 <h3>批量生成章节</h3>
