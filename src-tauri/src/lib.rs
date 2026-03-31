@@ -1339,6 +1339,36 @@ async fn cancel_batch_generation() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_consistency(
+    project_id: String,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+) -> Result<Value, String> {
+    let summaries = storage::load_json(&project_id, "chapter_summaries.json")?.unwrap_or(json!({}));
+    if summaries.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return Err("没有章节摘要数据，请先生成章节并运行摘要".into());
+    }
+    let world = storage::load_json(&project_id, "world.json")?.unwrap_or(json!({}));
+    let chars = storage::load_json(&project_id, "characters.json")?.unwrap_or(json!({}));
+
+    let summaries_str = serde_json::to_string_pretty(&summaries).unwrap_or_default();
+    let world_str = format!("时代：{}\n概要：{}",
+        world["era"].as_str().unwrap_or(""),
+        truncate_chars(world["overview"].as_str().unwrap_or(""), 800),
+    );
+    let chars_str = chars["characters"].as_array()
+        .map(|a| a.iter().take(8).map(|c| {
+            format!("{}（{}）：{}", c["name"].as_str().unwrap_or(""), c["role"].as_str().unwrap_or(""), c["personality"].as_str().unwrap_or(""))
+        }).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default();
+
+    let client = make_client(&api_format, &api_key, &model, &base_url);
+    engine::check_consistency(&client, &truncate_chars(&summaries_str, 6000), &world_str, &chars_str).await
+}
+
+#[tauri::command]
 async fn export_novel(project_id: String, format: String) -> Result<String, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let title = meta["title"].as_str().unwrap_or("novel");
@@ -1457,6 +1487,7 @@ pub fn run() {
             export_novel,
             batch_generate_chapters,
             cancel_batch_generation,
+            check_consistency,
             list_skills,
             install_skill_repo,
             update_skill_repo,

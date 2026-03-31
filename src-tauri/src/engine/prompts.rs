@@ -163,3 +163,44 @@ pub fn continue_write(
 输出 JSON：{{"text": "续写的内容"}}"#
     )
 }
+
+pub fn consistency_check(
+    summaries_json: &str,
+    world_summary: &str,
+    characters_summary: &str,
+) -> String {
+    format!(
+        r#"请分析以下小说的全部章节摘要，检查前后一致性问题。
+
+## 世界设定
+{world_summary}
+
+## 角色设定
+{characters_summary}
+
+## 各章摘要与状态
+{summaries_json}
+
+请严格检查以下维度：
+1. 角色行为一致性：角色言行是否与性格人设冲突，是否出现 OOC
+2. 时间线一致性：事件先后顺序是否矛盾，时间跨度是否合理
+3. 设定一致性：世界规则、地理、道具、能力等是否前后矛盾
+4. 伏笔一致性：已埋伏笔是否被遗忘，回收是否与埋设矛盾
+5. 情节逻辑：是否存在逻辑漏洞、不合理的巧合、未解释的转折
+
+输出 JSON：
+{{
+  "issues": [
+    {{
+      "severity": "high/medium/low",
+      "category": "character/timeline/setting/foreshadowing/plot_hole",
+      "location": "第X章 vs 第Y章",
+      "description": "具体矛盾描述",
+      "suggestion": "修复建议"
+    }}
+  ],
+  "overall_score": 85,
+  "summary": "总体一致性评估（2-3句话）"
+}}"#
+    )
+}

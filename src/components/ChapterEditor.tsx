@@ -54,6 +54,9 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [partialPreview, setPartialPreview] = useState("");
   const prevWordCount = useRef(0);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [chapterContext, setChapterContext] = useState<any>(null);
+  const [showStates, setShowStates] = useState(false);
+  const [showForeshadowing, setShowForeshadowing] = useState(false);
 
   useEffect(() => {
     api.getPlot(projectId).then((plot: any) => {
@@ -81,6 +84,12 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
         prevWordCount.current = t.length;
       })
       .catch(() => { setText(""); prevWordCount.current = 0; });
+  }, [projectId, chapterNum]);
+
+  useEffect(() => {
+    api.buildChapterContext(projectId, chapterNum)
+      .then(setChapterContext)
+      .catch(() => setChapterContext(null));
   }, [projectId, chapterNum]);
 
   const currentChapter = chapters.find(c => c.number === chapterNum);
@@ -315,6 +324,47 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
               </>
             )}
           </div>
+
+          {/* Compact Tracking Panels */}
+          {chapterContext && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+              {/* Character States */}
+              {Array.isArray(chapterContext.character_states) && chapterContext.character_states.length > 0 && (
+                <div className="tracking-compact-panel">
+                  <div className="tracking-compact-head" onClick={() => setShowStates(!showStates)}>
+                    <h4>前情状态 ({chapterContext.character_states.length})</h4>
+                    <span>{showStates ? "▼" : "▶"}</span>
+                  </div>
+                  {showStates && (
+                    <div className="tracking-compact-body">
+                      {chapterContext.character_states.slice(-8).map((s: any, i: number) => (
+                        <div key={i} className="tracking-compact-item">
+                          <strong>{s.name}</strong>：{s.change} <span className="dim">（第{s.chapter}章）</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Active Foreshadowing */}
+              {Array.isArray(chapterContext.active_foreshadowing) && chapterContext.active_foreshadowing.length > 0 && (
+                <div className="tracking-compact-panel">
+                  <div className="tracking-compact-head" onClick={() => setShowForeshadowing(!showForeshadowing)}>
+                    <h4>活跃伏笔 <span className="tag">{chapterContext.active_foreshadowing.length}</span></h4>
+                    <span>{showForeshadowing ? "▼" : "▶"}</span>
+                  </div>
+                  {showForeshadowing && (
+                    <div className="tracking-compact-body">
+                      {chapterContext.active_foreshadowing.map((f: string, i: number) => (
+                        <span key={i} className="foreshadow-chip">{f}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="mode-switch">
             <button className={mode === "fill" ? "active" : ""} onClick={() => setMode("fill")}>补足字数</button>
             <button className={mode === "partial" ? "active" : ""} onClick={() => setMode("partial")}>局部补写</button>

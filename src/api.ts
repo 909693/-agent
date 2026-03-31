@@ -164,6 +164,10 @@ export const api = {
   }),
   cancelBatchGeneration: () => invoke("cancel_batch_generation"),
 
+  // Consistency check
+  checkConsistency: (projectId: string, llm: LlmParams) =>
+    invoke<any>("check_consistency", { projectId, ...llmArgs(llm) }),
+
   listSkills: () => invoke<SkillRecord[]>("list_skills"),
   installSkillRepo: (repoUrl: string) =>
     invoke<SkillRecord>("install_skill_repo", { repoUrl }),

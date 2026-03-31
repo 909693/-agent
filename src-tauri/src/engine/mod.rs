@@ -109,3 +109,15 @@ pub async fn summarize_chapter(
     );
     client.generate_json(system, &user, 2048).await
 }
+
+/// Check consistency across all chapters
+pub async fn check_consistency(
+    client: &LlmClient,
+    summaries_json: &str,
+    world_summary: &str,
+    characters_summary: &str,
+) -> Result<Value, String> {
+    let system = "你是资深小说编辑，擅长发现长篇小说中的前后矛盾和逻辑漏洞。请以 JSON 格式输出分析结果。";
+    let user = prompts::consistency_check(summaries_json, world_summary, characters_summary);
+    client.generate_json(system, &user, 4096).await
+}

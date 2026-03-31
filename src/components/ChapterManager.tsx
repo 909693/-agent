@@ -13,7 +13,7 @@ interface Props {
   onWriteChapter: (chapterNum: number) => void;
 }
 
-type ManagerTab = "world" | "characters" | "plot" | "chapter-list";
+type ManagerTab = "world" | "characters" | "plot" | "chapter-list" | "tracking";
 
 const genreLabels: Record<string, string> = {
   fantasy: "玄幻", scifi: "科幻", urban: "都市", romance: "言情",
@@ -45,9 +45,15 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [batchResult, setBatchResult] = useState<BatchComplete | null>(null);
   const [chapterStatuses, setChapterStatuses] = useState<Record<number, string>>({});
 
+  // Tracking state
+  const [summaries, setSummaries] = useState<any>(null);
+  const [consistencyResult, setConsistencyResult] = useState<any>(null);
+  const [checkingConsistency, setCheckingConsistency] = useState(false);
+
   useEffect(() => {
     api.getWorld(project.id).then(setWorld).catch(() => setWorld(null));
     api.getCharacters(project.id).then(setCharacters).catch(() => setCharacters(null));
+    api.getChapterSummaries(project.id).then(setSummaries).catch(() => setSummaries(null));
     api.getPlot(project.id).then(p => {
       setPlot(p);
       loadChapterTexts(p);
@@ -212,6 +218,60 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     try { await api.cancelBatchGeneration(); } catch (e: any) { setError(e.toString()); }
   };
 
+  // === Tracking data processing ===
+  const characterTimeline: Record<string, Array<{ chapter: number; change: string }>> = {};
+  const foreshadowingItems: Array<{ content: string; plantedChapter: number; resolvedChapter: number | null; status: "active" | "resolved" }> = [];
+
+  if (summaries && typeof summaries === "object") {
+    const sortedKeys = Object.keys(summaries).sort((a, b) => Number(a) - Number(b));
+    const allResolved: Array<{ text: string; chapter: number }> = [];
+
+    for (const key of sortedKeys) {
+      const ch = Number(key);
+      const s = summaries[key];
+      // Character timeline
+      if (Array.isArray(s.character_changes)) {
+        for (const c of s.character_changes) {
+          const name = c.name || "";
+          if (name) {
+            if (!characterTimeline[name]) characterTimeline[name] = [];
+            characterTimeline[name].push({ chapter: ch, change: c.change || "" });
+          }
+        }
+      }
+      // Foreshadowing planted
+      if (Array.isArray(s.foreshadowing_planted)) {
+        for (const f of s.foreshadowing_planted) {
+          if (f) foreshadowingItems.push({ content: f, plantedChapter: ch, resolvedChapter: null, status: "active" });
+        }
+      }
+      // Foreshadowing resolved
+      if (Array.isArray(s.foreshadowing_resolved)) {
+        for (const f of s.foreshadowing_resolved) {
+          if (f) allResolved.push({ text: f, chapter: ch });
+        }
+      }
+    }
+    // Cross-reference: mark resolved
+    for (const r of allResolved) {
+      const match = foreshadowingItems.find(fi => fi.status === "active" && fi.content.includes(r.text));
+      if (match) { match.status = "resolved"; match.resolvedChapter = r.chapter; }
+    }
+  }
+
+  const activeForeshadowing = foreshadowingItems.filter(f => f.status === "active");
+  const resolvedForeshadowing = foreshadowingItems.filter(f => f.status === "resolved");
+
+  const handleCheckConsistency = async () => {
+    if (!llm.apiKey) { setError("请先配置 API Key"); return; }
+    setCheckingConsistency(true); setError(""); setConsistencyResult(null);
+    try {
+      const result = await api.checkConsistency(project.id, llm);
+      setConsistencyResult(result);
+    } catch (e: any) { setError(e.toString()); }
+    setCheckingConsistency(false);
+  };
+
   const allChapters: { number: number; title: string; summary: string }[] = [];
   const characterList = characters?.characters || [];
   const protagonist = characterList.find((c: any) => c.role === "protagonist") || characterList[0] || null;
@@ -271,7 +331,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
         <div className="manager-tabs">
-          {([["world", "世界观"], ["characters", "角色"], ["plot", "情节大纲"], ["chapter-list", "章节列表"]] as const).map(([key, label]) => (
+          {([["world", "世界观"], ["characters", "角色"], ["plot", "情节大纲"], ["chapter-list", "章节列表"], ["tracking", "追踪"]] as const).map(([key, label]) => (
             <button key={key} className={`manager-tab ${tab === key ? "active" : ""}`} onClick={() => setTab(key)}>
               {label}
             </button>
@@ -557,6 +617,114 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
           )}
         </div>
       )}
+
+      {tab === "tracking" && (
+        <div>
+          {!summaries || Object.keys(summaries).length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">📊</div>
+              <p>暂无追踪数据，请先生成章节并运行摘要</p>
+            </div>
+          ) : (
+            <>
+              {/* Character State Timeline */}
+              <div className="content-section">
+                <h3>角色状态追踪</h3>
+                {Object.keys(characterTimeline).length === 0 ? (
+                  <p className="dim">暂无角色状态变化记录</p>
+                ) : (
+                  <div className="card-grid">
+                    {Object.entries(characterTimeline).map(([name, changes]) => (
+                      <div key={name} className="character-timeline-card">
+                        <h4>{name} <span className="current-state-badge">{changes[changes.length - 1]?.change}</span></h4>
+                        <div className="timeline-list">
+                          {changes.map((c, i) => (
+                            <div key={i} className="timeline-entry">
+                              <span className="chapter-ref">第{c.chapter}章</span>
+                              <span className="change-text">{c.change}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Foreshadowing Dashboard */}
+              <div className="content-section">
+                <h3>伏笔追踪 <span className="tag">活跃 {activeForeshadowing.length}</span> <span className="tag" style={{ background: "var(--success-light)", color: "var(--success)" }}>已回收 {resolvedForeshadowing.length}</span></h3>
+                {foreshadowingItems.length === 0 ? (
+                  <p className="dim">暂无伏笔记录</p>
+                ) : (
+                  <>
+                    {activeForeshadowing.length > 0 && (
+                      <div style={{ marginBottom: 16 }}>
+                        <h4 style={{ fontSize: 14, marginBottom: 8 }}>活跃伏笔</h4>
+                        {activeForeshadowing.map((f, i) => (
+                          <div key={i} className="foreshadow-item foreshadow-active">
+                            <div className="foreshadow-content">{f.content}</div>
+                            <div className="foreshadow-meta">第{f.plantedChapter}章埋设</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {resolvedForeshadowing.length > 0 && (
+                      <div>
+                        <h4 style={{ fontSize: 14, marginBottom: 8 }}>已回收</h4>
+                        {resolvedForeshadowing.map((f, i) => (
+                          <div key={i} className="foreshadow-item foreshadow-resolved">
+                            <div className="foreshadow-content">{f.content}</div>
+                            <div className="foreshadow-meta">第{f.plantedChapter}章 → 第{f.resolvedChapter}章</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Consistency Check */}
+              <div className="content-section">
+                <h3>一致性检查</h3>
+                <div className="generate-bar">
+                  <button className="btn-primary" onClick={handleCheckConsistency} disabled={checkingConsistency}>
+                    {checkingConsistency ? <><span className="loading-spinner" />检查中...</> : "运行 AI 一致性检查"}
+                  </button>
+                </div>
+                {consistencyResult && (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+                      <div className="consistency-score">{consistencyResult.overall_score ?? "—"}</div>
+                      <div>
+                        <div style={{ fontWeight: 600 }}>一致性评分</div>
+                        <div className="dim" style={{ fontSize: 13 }}>{consistencyResult.summary}</div>
+                      </div>
+                    </div>
+                    {Array.isArray(consistencyResult.issues) && consistencyResult.issues.length > 0 ? (
+                      consistencyResult.issues.map((issue: any, i: number) => (
+                        <div key={i} className={`consistency-issue issue-severity-${issue.severity}`}>
+                          <div className="issue-header">
+                            <span className="issue-category">{
+                              { character: "角色", timeline: "时间线", setting: "设定", foreshadowing: "伏笔", plot_hole: "情节漏洞" }[issue.category as string] || issue.category
+                            }</span>
+                            <span className="issue-location">{issue.location}</span>
+                          </div>
+                          <p style={{ margin: "4px 0", fontSize: 13 }}>{issue.description}</p>
+                          {issue.suggestion && <p className="dim" style={{ fontSize: 12 }}>建议：{issue.suggestion}</p>}
+                        </div>
+                      ))
+                    ) : (
+                      <p className="dim">未发现一致性问题</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {showExport && (
         <ExportDialog
           projectId={project.id}
