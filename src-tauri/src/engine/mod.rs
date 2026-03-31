@@ -121,3 +121,25 @@ pub async fn check_consistency(
     let user = prompts::consistency_check(summaries_json, world_summary, characters_summary);
     client.generate_json(system, &user, 4096).await
 }
+
+/// Simulate reader experience for a chapter
+pub async fn simulate_reader(
+    client: &LlmClient,
+    chapter_text: &str,
+    chapter_outline: &str,
+    context: &str,
+) -> Result<Value, String> {
+    let system = "你是阅读体验分析专家，能精准模拟不同类型读者的阅读感受。请以 JSON 格式输出。";
+    let user = prompts::reader_simulation(chapter_text, chapter_outline, context);
+    client.generate_json(system, &user, 4096).await
+}
+
+/// Analyze writing style from text samples
+pub async fn analyze_style(
+    client: &LlmClient,
+    samples: &str,
+) -> Result<Value, String> {
+    let system = "你是文学评论家和文体学专家，擅长从文本中提取精确的风格特征。请以 JSON 格式输出。";
+    let user = prompts::analyze_style(samples);
+    client.generate_json(system, &user, 4096).await
+}

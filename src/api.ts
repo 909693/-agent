@@ -178,6 +178,14 @@ export const api = {
   searchChapters: (projectId: string, query: string) =>
     invoke<any>("search_chapters", { projectId, query }),
 
+  // Reader simulation & Style
+  simulateReader: (projectId: string, chapterNumber: number, chapterText: string, llm: LlmParams) =>
+    invoke<any>("simulate_reader", { projectId, chapterNumber, chapterText, ...llmArgs(llm) }),
+  analyzeWritingStyle: (projectId: string, llm: LlmParams) =>
+    invoke<any>("analyze_writing_style", { projectId, ...llmArgs(llm) }),
+  getStyleProfile: (projectId: string) =>
+    invoke<any>("get_style_profile", { projectId }),
+
   listSkills: () => invoke<SkillRecord[]>("list_skills"),
   installSkillRepo: (repoUrl: string) =>
     invoke<SkillRecord>("install_skill_repo", { repoUrl }),

@@ -1563,3 +1563,28 @@ body {
 .snapshots-panel { background: var(--bg-white); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; margin-top: 8px; max-height: 200px; overflow-y: auto; }
 .snapshot-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border-light); }
 .snapshot-item:last-child { border-bottom: none; }
+
+/* ===== Reader Simulation ===== */
+.reader-result { margin-top: 12px; }
+.reader-score { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.reader-dimension { font-size: 13px; margin-bottom: 6px; line-height: 1.6; }
+.reader-section { margin-top: 12px; padding: 8px 12px; border-radius: var(--radius); }
+.reader-section h4 { font-size: 13px; margin-bottom: 6px; }
+.reader-item { font-size: 12px; color: var(--text-secondary); padding: 4px 0; line-height: 1.5; }
+.reader-peaks { background: var(--success-light); }
+.reader-peaks h4 { color: var(--success); }
+.reader-confusion { background: #FEF3C7; }
+.reader-confusion h4 { color: #D97706; }
+.reader-risks { background: var(--danger-light); }
+.reader-risks h4 { color: var(--danger); }
+
+/* ===== Style Profile ===== */
+.style-summary { background: var(--accent-light); color: var(--accent); padding: 12px; border-radius: var(--radius); font-size: 13px; line-height: 1.6; font-style: italic; }
+
+/* ===== Narrative Lines ===== */
+.narrative-lines { display: flex; flex-direction: column; gap: 12px; }
+.narrative-line { display: flex; align-items: center; gap: 12px; }
+.narrative-line-label { min-width: 80px; font-size: 13px; font-weight: 600; text-align: right; color: var(--text-secondary); }
+.narrative-line-track { display: flex; gap: 6px; flex-wrap: wrap; }
+.narrative-node { width: 28px; height: 28px; border-radius: 50%; background: var(--accent-light); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+.narrative-node:hover { background: var(--accent); color: white; }

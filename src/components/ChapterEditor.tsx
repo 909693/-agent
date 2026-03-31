@@ -38,7 +38,8 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [targetWords, setTargetWords] = useState(3000);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [mode, setMode] = useState<"fill" | "partial" | "expand" | "continue" | "review">("fill");
+  const [mode, setMode] = useState<"fill" | "partial" | "expand" | "continue" | "review" | "reader">("fill");
+  const [readerResult, setReaderResult] = useState<any>(null);
   const [chapters, setChapters] = useState<ChapterInfo[]>([]);
   const [characters, setCharacters] = useState<CharacterInfo[]>([]);
   const [selectedCharacterId, setSelectedCharacterId] = useState("");
@@ -166,6 +167,17 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       const payload = await buildCreativeConstraintsPayload();
       const result = await api.reviewChapter(projectId, chapterNum, text, platform, llm, payload);
       setReviewResult(result);
+    } catch (e: any) { setError(e.toString()); }
+    setLoading(false);
+  };
+
+  const handleReaderSim = async () => {
+    if (!llm.apiKey) { setError("请先配置 API Key"); return; }
+    if (!text.trim()) { setError("章节内容为空"); return; }
+    setLoading(true); setError(""); setReaderResult(null);
+    try {
+      const result = await api.simulateReader(projectId, chapterNum, text, llm);
+      setReaderResult(result);
     } catch (e: any) { setError(e.toString()); }
     setLoading(false);
   };
@@ -414,6 +426,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
             <button className={mode === "expand" ? "active" : ""} onClick={() => setMode("expand")}>按大纲扩写</button>
             <button className={mode === "continue" ? "active" : ""} onClick={() => setMode("continue")}>逐段续写</button>
             <button className={mode === "review" ? "active" : ""} onClick={() => setMode("review")}>AI审校</button>
+            <button className={mode === "reader" ? "active" : ""} onClick={() => setMode("reader")}>读者模拟</button>
           </div>
 
           {mode === "review" ? (
@@ -432,6 +445,51 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
               {reviewResult && (
                 <div className="review-result">
                   {reviewResult}
+                </div>
+              )}
+            </>
+          ) : mode === "reader" ? (
+            <>
+              <button onClick={handleReaderSim} disabled={loading || !text.trim()}>
+                {loading ? <><span className="loading-spinner" />模拟中...</> : "模拟读者阅读"}
+              </button>
+              {readerResult && (
+                <div className="reader-result">
+                  <div className="reader-score">
+                    <span className="consistency-score">{readerResult.engagement_score ?? "—"}</span>
+                    <span style={{ fontSize: 13 }}>沉浸度</span>
+                  </div>
+                  <div className="reader-dimension">
+                    <strong>钩子力：</strong>{readerResult.hook_power}
+                  </div>
+                  <div className="reader-dimension">
+                    <strong>节奏感：</strong>{readerResult.pacing_feel}
+                  </div>
+                  {Array.isArray(readerResult.excitement_peaks) && readerResult.excitement_peaks.length > 0 && (
+                    <div className="reader-section reader-peaks">
+                      <h4>爽点</h4>
+                      {readerResult.excitement_peaks.map((p: any, i: number) => (
+                        <div key={i} className="reader-item">{p.location}：{p.reaction}</div>
+                      ))}
+                    </div>
+                  )}
+                  {Array.isArray(readerResult.confusion_points) && readerResult.confusion_points.length > 0 && (
+                    <div className="reader-section reader-confusion">
+                      <h4>困惑点</h4>
+                      {readerResult.confusion_points.map((p: any, i: number) => (
+                        <div key={i} className="reader-item">{p.location}：{p.issue}</div>
+                      ))}
+                    </div>
+                  )}
+                  {Array.isArray(readerResult.drop_risks) && readerResult.drop_risks.length > 0 && (
+                    <div className="reader-section reader-risks">
+                      <h4>弃文风险</h4>
+                      {readerResult.drop_risks.map((p: any, i: number) => (
+                        <div key={i} className="reader-item">{p.location}：{p.reason}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="reader-dimension dim">{readerResult.overall_feel}</div>
                 </div>
               )}
             </>

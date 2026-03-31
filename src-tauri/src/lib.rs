@@ -841,7 +841,13 @@ async fn expand_chapter(
     base_url: String,
 ) -> Result<Value, String> {
     let chapter_outline = find_chapter_outline(&project_id, chapter_number)?;
-    let context = build_rich_context_string(&project_id, chapter_number)?;
+    let mut context = build_rich_context_string(&project_id, chapter_number)?;
+    // Inject style profile if available
+    if let Ok(Some(style)) = storage::load_json(&project_id, "style_profile.json") {
+        if let Some(summary) = style["summary"].as_str() {
+            context.push_str(&format!("\n\n## 作者文风\n{}", summary));
+        }
+    }
     let constraints_text = build_constraints_text(constraints.as_ref());
 
     let client = make_client(&api_format, &api_key, &model, &base_url);
@@ -882,10 +888,13 @@ async fn continue_writing(
         .ok_or("Chapter not found, use expand first")?;
     let existing_text = existing["text"].as_str().unwrap_or("");
 
-    let context = build_rich_context_string(&project_id, chapter_number)?;
-    let constraints_text = build_constraints_text(constraints.as_ref());
-
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let mut context = build_rich_context_string(&project_id, chapter_number)?;
+    if let Ok(Some(style)) = storage::load_json(&project_id, "style_profile.json") {
+        if let Some(summary) = style["summary"].as_str() {
+            context.push_str(&format!("\n\n## 作者文风\n{}", summary));
+        }
+    }
+    let constraints_text = build_constraints_text(constraints.as_ref());    let client = make_client(&api_format, &api_key, &model, &base_url);
     // Truncate existing text to last 2000 chars to avoid token overflow
     let existing_tail = if existing_text.len() > 2000 { &existing_text[existing_text.len()-2000..] } else { existing_text };
     let result = engine::continue_writing(
@@ -1471,6 +1480,64 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
     Ok(json!(results))
 }
 
+// ===== Reader Simulation & Style Analysis =====
+
+#[tauri::command]
+async fn simulate_reader(
+    project_id: String,
+    chapter_number: u32,
+    chapter_text: String,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+) -> Result<Value, String> {
+    let chapter_outline = find_chapter_outline(&project_id, chapter_number).unwrap_or_default();
+    let context = build_rich_context_string(&project_id, chapter_number)?;
+    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let truncated = truncate_chars(&chapter_text, 8000);
+    engine::simulate_reader(&client, truncated, &chapter_outline, &truncate_chars(&context, 2000)).await
+}
+
+#[tauri::command]
+async fn analyze_writing_style(
+    project_id: String,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+) -> Result<Value, String> {
+    // Collect up to 5 written chapters as samples
+    let mut samples = Vec::new();
+    for num in 1..=100u32 {
+        if samples.len() >= 5 { break; }
+        let file = format!("chapter_{:03}.json", num);
+        if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
+            if let Some(text) = ch["text"].as_str() {
+                if !text.is_empty() {
+                    samples.push(format!("--- 第{}章样本 ---\n{}", num, truncate_chars(text, 2000)));
+                }
+            }
+        }
+    }
+    if samples.len() < 3 {
+        return Err("至少需要 3 章已写内容才能分析文风".into());
+    }
+    let combined = samples.join("\n\n");
+    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let result = engine::analyze_style(&client, &combined).await?;
+
+    // Save style profile
+    storage::save_json(&project_id, "style_profile.json", &result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn get_style_profile(project_id: String) -> Result<Value, String> {
+    storage::load_json(&project_id, "style_profile.json")?
+        .ok_or_else(|| "尚未分析文风".into())
+}
+
 #[tauri::command]
 async fn export_novel(project_id: String, format: String) -> Result<String, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
@@ -1594,6 +1661,9 @@ pub fn run() {
             list_chapter_snapshots,
             restore_snapshot,
             search_chapters,
+            simulate_reader,
+            analyze_writing_style,
+            get_style_profile,
             list_skills,
             install_skill_repo,
             update_skill_repo,

@@ -49,6 +49,8 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [summaries, setSummaries] = useState<any>(null);
   const [consistencyResult, setConsistencyResult] = useState<any>(null);
   const [checkingConsistency, setCheckingConsistency] = useState(false);
+  const [styleProfile, setStyleProfile] = useState<any>(null);
+  const [analyzingStyle, setAnalyzingStyle] = useState(false);
 
   // Search state
   const [searchQuery, setSearchQuery] = useState("");
@@ -59,6 +61,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     api.getWorld(project.id).then(setWorld).catch(() => setWorld(null));
     api.getCharacters(project.id).then(setCharacters).catch(() => setCharacters(null));
     api.getChapterSummaries(project.id).then(setSummaries).catch(() => setSummaries(null));
+    api.getStyleProfile(project.id).then(setStyleProfile).catch(() => setStyleProfile(null));
     api.getPlot(project.id).then(p => {
       setPlot(p);
       loadChapterTexts(p);
@@ -285,6 +288,16 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setSearchResults(Array.isArray(results) ? results : []);
     } catch (e: any) { setError(e.toString()); }
     setSearching(false);
+  };
+
+  const handleAnalyzeStyle = async () => {
+    if (!llm.apiKey) { setError("请先配置 API Key"); return; }
+    setAnalyzingStyle(true); setError("");
+    try {
+      const result = await api.analyzeWritingStyle(project.id, llm);
+      setStyleProfile(result);
+    } catch (e: any) { setError(e.toString()); }
+    setAnalyzingStyle(false);
   };
 
   const allChapters: { number: number; title: string; summary: string }[] = [];
@@ -771,11 +784,77 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                   </div>
                 )}
               </div>
+
+              {/* Style Analysis */}
+              <div className="content-section">
+                <h3>文风分析</h3>
+                <div className="generate-bar">
+                  <button className="btn-primary" onClick={handleAnalyzeStyle} disabled={analyzingStyle}>
+                    {analyzingStyle ? <><span className="loading-spinner" />分析中...</> : "分析我的文风"}
+                  </button>
+                  {styleProfile && <span className="dim" style={{ fontSize: 12 }}>已学习，后续生成将自动应用</span>}
+                </div>
+                {styleProfile && (
+                  <div style={{ marginTop: 12 }}>
+                    <div className="style-summary">{styleProfile.summary}</div>
+                    <div className="card-grid" style={{ marginTop: 12 }}>
+                      {[
+                        ["叙述视角", styleProfile.narrative_voice],
+                        ["句式特征", styleProfile.sentence_style],
+                        ["对话风格", styleProfile.dialogue_style],
+                        ["描写详略", styleProfile.description_level],
+                        ["叙事节奏", styleProfile.pacing_pattern],
+                        ["用词倾向", styleProfile.vocabulary_tendency],
+                        ["情感基调", styleProfile.emotional_tone],
+                      ].filter(([, v]) => v).map(([label, value], i) => (
+                        <div key={i} className="info-card" style={{ minWidth: 200 }}>
+                          <h4 style={{ fontSize: 13 }}>{label}</h4>
+                          <p style={{ fontSize: 12 }}>{value}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Narrative Lines */}
+              <div className="content-section">
+                <h3>多线叙事</h3>
+                {(() => {
+                  const povLines: Record<string, Array<{ number: number; title: string }>> = {};
+                  for (const act of (plot?.acts || [])) {
+                    for (const ch of (act.chapters || [])) {
+                      const pov = ch.pov_character || "全知视角";
+                      if (!povLines[pov]) povLines[pov] = [];
+                      povLines[pov].push({ number: ch.number, title: ch.title || "" });
+                    }
+                  }
+                  const lineNames = Object.keys(povLines);
+                  if (lineNames.length <= 1) {
+                    return <p className="dim">仅检测到单一叙事线（或未设置 POV 角色）</p>;
+                  }
+                  return (
+                    <div className="narrative-lines">
+                      {lineNames.map(name => (
+                        <div key={name} className="narrative-line">
+                          <div className="narrative-line-label">{name}</div>
+                          <div className="narrative-line-track">
+                            {povLines[name].map(ch => (
+                              <div key={ch.number} className="narrative-node" title={`第${ch.number}章 ${ch.title}`} onClick={() => onWriteChapter(ch.number)}>
+                                {ch.number}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
             </>
           )}
         </div>
       )}
-
       {showExport && (
         <ExportDialog
           projectId={project.id}

@@ -204,3 +204,66 @@ pub fn consistency_check(
 }}"#
     )
 }
+
+pub fn reader_simulation(
+    chapter_text: &str,
+    chapter_outline: &str,
+    context: &str,
+) -> String {
+    format!(
+        r#"请模拟三类读者阅读以下章节，给出真实反馈。
+
+三类读者：
+1. 追更老书虫：熟悉套路，关注爽点和节奏
+2. 新入坑路人：首次接触，关注能否看懂和代入
+3. 严苛挑刺党：关注逻辑、文笔和原创性
+
+## 章节大纲
+{chapter_outline}
+
+## 前文背景
+{context}
+
+## 章节正文
+{chapter_text}
+
+请综合三类读者视角，输出 JSON：
+{{
+  "engagement_score": 75,
+  "hook_power": "章首钩子是否有力，能否吸引继续阅读",
+  "pacing_feel": "节奏感受：拖沓/紧凑/失控/张弛有度",
+  "confusion_points": [
+    {{"location": "约第N段", "issue": "不清楚为什么..."}}
+  ],
+  "excitement_peaks": [
+    {{"location": "约第N段", "reaction": "这里很爽因为..."}}
+  ],
+  "drop_risks": [
+    {{"location": "约第N段", "reason": "这里可能弃文因为..."}}
+  ],
+  "overall_feel": "一句话总结阅读感受"
+}}"#
+    )
+}
+
+pub fn analyze_style(samples: &str) -> String {
+    format!(
+        r#"请分析以下小说文本样本的写作风格特征。
+
+## 文本样本
+{samples}
+
+请从以下维度提取风格特征，输出 JSON：
+{{
+  "narrative_voice": "叙述视角偏好（如第三人称限制视角、全知视角等）",
+  "sentence_style": "句式特征（长短句比例、平均句长、节奏感）",
+  "rhetoric_preference": ["常用修辞手法1", "修辞手法2"],
+  "dialogue_style": "对话风格（简洁/繁复，'说'字的使用习惯）",
+  "description_level": "描写详略偏好（动作/环境/心理/外貌各维度）",
+  "pacing_pattern": "叙事节奏模式（快/慢/交替/渐进）",
+  "vocabulary_tendency": "用词倾向（口语化/文雅/专业术语/方言等）",
+  "emotional_tone": "情感基调（冷峻/温暖/幽默/热血等）",
+  "summary": "用2-3句话总结该作者的核心文风特点，可直接用于指导AI写作"
+}}"#
+    )
+}
