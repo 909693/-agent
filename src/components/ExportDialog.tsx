@@ -39,7 +39,7 @@ export function ExportDialog({ projectId, projectTitle, onClose }: Props) {
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 6 }}>导出格式</div>
           <div style={{ display: "flex", gap: 8 }}>
-            {[{ value: "txt", label: "TXT 纯文本" }].map((f) => (
+            {[{ value: "txt", label: "TXT 纯文本" }, { value: "md", label: "Markdown" }, { value: "html", label: "HTML (可打印PDF)" }].map((f) => (
               <button key={f.value}
                 className={`btn-sm`}
                 style={format === f.value ? { background: "var(--accent)", color: "white", borderColor: "var(--accent)" } : {}}
@@ -47,8 +47,6 @@ export function ExportDialog({ projectId, projectTitle, onClose }: Props) {
                 {f.label}
               </button>
             ))}
-            <button className="btn-sm" disabled style={{ opacity: 0.4 }}>EPUB (即将支持)</button>
-            <button className="btn-sm" disabled style={{ opacity: 0.4 }}>PDF (即将支持)</button>
           </div>
         </div>
         {error && <div className="error">{error}</div>}

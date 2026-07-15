@@ -73,6 +73,7 @@ export function OutlineImporter({ onCreated, onClose }: Props) {
         await api.saveCharactersData(project.id, characters);
       }
       onCreated(project);
+      onClose();
     } catch (e: any) {
       setError(e.toString());
     }

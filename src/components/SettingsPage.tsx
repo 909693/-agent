@@ -9,56 +9,53 @@ interface Props {
   onThemeChange: (theme: string) => void;
 }
 
-type Profile = { apiKey: string; model: string; baseUrl: string };
+type Profile = { apiKey: string; model: string; baseUrl: string; proxyUrl?: string };
 type Profiles = Record<string, Profile>;
-
-const PROFILES_KEY = "llm_profiles";
-
-function loadProfiles(): Profiles {
-  try {
-    const raw = localStorage.getItem(PROFILES_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return {};
-}
-
-function saveProfiles(p: Profiles) {
-  localStorage.setItem(PROFILES_KEY, JSON.stringify(p));
-}
 
 export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
   const isConfigured = !!(llm.apiKey && llm.model);
   const [dataDir, setDataDir] = useState("");
   const [changing, setChanging] = useState(false);
   const [msg, setMsg] = useState("");
-  const [profiles, setProfiles] = useState<Profiles>(loadProfiles);
+  const [profiles, setProfiles] = useState<Profiles>({});
+  const [profilesLoaded, setProfilesLoaded] = useState(false);
   const [testResult, setTestResult] = useState("");
   const [testing, setTesting] = useState(false);
 
   useEffect(() => {
     api.getDataDir().then(setDataDir).catch(() => setDataDir("未知"));
+    // Load profiles from backend
+    api.getLlmProfiles().then(p => {
+      setProfiles(p);
+      setProfilesLoaded(true);
+    }).catch(() => {
+      setProfiles({});
+      setProfilesLoaded(true);
+    });
   }, []);
 
   // When format changes, save current config to old profile, load new profile
   const handleFormatChange = (newFormat: string) => {
-    // Save current to profiles
+    if (!profilesLoaded) return;
+
+    // Save current to profiles (proxyUrl is global, not per-profile)
     const updated = {
       ...profiles,
       [llm.apiFormat]: { apiKey: llm.apiKey, model: llm.model, baseUrl: llm.baseUrl },
     };
     setProfiles(updated);
-    saveProfiles(updated);
+    api.saveLlmProfiles(updated).catch(() => {});
 
-    // Load saved profile for new format (or empty)
+    // Load saved profile for new format, keep proxyUrl from current config
     const saved = updated[newFormat] || { apiKey: "", model: "", baseUrl: "" };
-    onChange({ apiFormat: newFormat, apiKey: saved.apiKey, model: saved.model, baseUrl: saved.baseUrl });
+    onChange({ apiFormat: newFormat, apiKey: saved.apiKey, model: saved.model, baseUrl: saved.baseUrl, proxyUrl: llm.proxyUrl });
   };
 
   const handleChangeDir = async (migrate: boolean) => {
     try {
       const selected = await dialogOpen({ directory: true, multiple: false, title: "选择数据存放目录" });
       if (!selected) return;
-      const newDir = typeof selected === "string" ? selected : (selected as any);
+      const newDir = typeof selected === "string" ? selected : "";
       if (!newDir || newDir === dataDir) return;
       setChanging(true); setMsg("");
       const result = await api.setDataDir(newDir, migrate);
@@ -144,6 +141,18 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
           />
         </div>
 
+        <div className="form-group">
+          <label>代理地址（可选）</label>
+          <input
+            value={llm.proxyUrl || ""}
+            onChange={e => onChange({ ...llm, proxyUrl: e.target.value || undefined })}
+            placeholder="http://127.0.0.1:7897"
+          />
+          <small style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 4, display: "block" }}>
+            留空则使用系统环境变量（HTTPS_PROXY/HTTP_PROXY）
+          </small>
+        </div>
+
         <div className="settings-hint-box">
           {fh.hint}
           <br />
@@ -161,7 +170,7 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
               onClick={async () => {
                 setTesting(true); setTestResult("");
                 try {
-                  const r = await api.testLlm(llm.apiFormat, llm.apiKey, llm.model, llm.baseUrl);
+                  const r = await api.testLlm(llm.apiFormat, llm.apiKey, llm.model, llm.baseUrl, llm.proxyUrl);
                   setTestResult(r);
                 } catch (e: any) { setTestResult("错误：" + e.toString()); }
                 finally { setTesting(false); }

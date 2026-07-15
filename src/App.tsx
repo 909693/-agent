@@ -14,6 +14,8 @@ import { SkillsManager } from "./components/SkillsManager";
 import { McpManager } from "./components/McpManager";
 import { OutlineImporter } from "./components/OutlineImporter";
 import { AgentChat } from "./components/AgentChat";
+import { CreateProjectDialog } from "./components/CreateProjectDialog";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./App.css";
 
 type Page = "dashboard" | "novels" | "chapters" | "editor" | "settings" | "chat" | "prompts" | "goals" | "genres" | "skills" | "mcp" | "agent";
@@ -32,7 +34,8 @@ function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [activeChapter, setActiveChapter] = useState(1);
   const [showOutlineImporter, setShowOutlineImporter] = useState(false);
-  const [agentMessages, setAgentMessages] = useState<Array<{ role: "user" | "assistant"; content: string; action?: any }>>([]);
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [agentMessages, setAgentMessages] = useState<Array<{ role: "user" | "assistant" | "tool"; content: string; action?: any; toolName?: string; toolSuccess?: boolean; streaming?: boolean }>>([]);
   const [chatDraft, setChatDraft] = useState<ChatDraft>({
     genre: null,
     messages: [],
@@ -41,12 +44,29 @@ function App() {
     error: "",
   });
   const [llm, setLlm] = useState<LlmParams>({
-    apiFormat: localStorage.getItem("llm_api_format") || "openai",
-    apiKey: localStorage.getItem("llm_api_key") || "",
-    model: localStorage.getItem("llm_model") || "",
-    baseUrl: localStorage.getItem("llm_base_url") || "",
+    apiFormat: "openai",
+    apiKey: "",
+    model: "",
+    baseUrl: "",
   });
+  const [llmLoaded, setLlmLoaded] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("retl_theme") || "light");
+
+  // Load LLM config from backend on mount
+  useEffect(() => {
+    api.getLlmConfig().then((config) => {
+      if (config && typeof config === "object") {
+        // Always load config, even if apiKey is empty (keychain might have failed)
+        setLlm(prev => ({
+          ...prev,
+          ...config,
+        }));
+      }
+      setLlmLoaded(true);
+    }).catch(() => {
+      setLlmLoaded(true);
+    });
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -57,16 +77,21 @@ function App() {
     api.listProjects().then(setProjects).catch(console.error);
   }, []);
 
+  // Save LLM config to backend when it changes (debounced, skip initial empty state)
   useEffect(() => {
-    localStorage.setItem("llm_api_format", llm.apiFormat);
-    localStorage.setItem("llm_api_key", llm.apiKey);
-    localStorage.setItem("llm_model", llm.model);
-    localStorage.setItem("llm_base_url", llm.baseUrl);
-  }, [llm]);
+    if (!llmLoaded) return;
+    const timer = setTimeout(() => {
+      api.saveLlmConfig(llm).catch(() => {});
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [llm, llmLoaded]);
   const isApiConfigured = !!(llm.apiKey && llm.model);
 
   const handleNewProject = () => {
-    setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
+    setShowCreateDialog(true);
+  };
+
+  const handleNewProjectChat = () => {
     setPage("chat");
   };
 
@@ -78,15 +103,22 @@ function App() {
 
   const handleSelectProject = (p: ProjectMeta) => {
     setCurrentProject(p);
+    setActiveChapter(1);
+    setAgentMessages([]);
+    setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
     setPage("chapters");
   };
 
   const handleDeleteProject = async (id: string) => {
-    await api.deleteProject(id);
-    setProjects(prev => prev.filter(p => p.id !== id));
-    if (currentProject?.id === id) {
-      setCurrentProject(null);
-      if (page === "chapters" || page === "editor") setPage("novels");
+    try {
+      await api.deleteProject(id);
+      setProjects(prev => prev.filter(p => p.id !== id));
+      if (currentProject?.id === id) {
+        setCurrentProject(null);
+        if (page === "chapters" || page === "editor") setPage("novels");
+      }
+    } catch (e: any) {
+      console.error("删除项目失败:", e);
     }
   };
 
@@ -96,7 +128,10 @@ function App() {
   };
 
   const handleNavigate = (target: string) => {
-    setPage(target as Page);
+    const validPages: Page[] = ["dashboard", "novels", "chapters", "editor", "settings", "chat", "prompts", "goals", "genres", "skills", "mcp", "agent"];
+    if (validPages.includes(target as Page)) {
+      setPage(target as Page);
+    }
   };
 
   const pageTitle: Record<Page, string> = {
@@ -114,6 +149,7 @@ function App() {
     agent: "AI 助手",
   };
   return (
+    <ErrorBoundary>
     <div className="app">
       <Sidebar
         currentPage={page === "editor" ? "chapters" : page === "chat" ? "novels" : page}
@@ -139,10 +175,17 @@ function App() {
               onClose={() => setShowOutlineImporter(false)}
             />
           )}
+          {showCreateDialog && (
+            <CreateProjectDialog
+              onCreated={handleProjectCreated}
+              onClose={() => setShowCreateDialog(false)}
+            />
+          )}
           {page === "dashboard" && (
             <Dashboard
               projects={projects}
               onNewNovel={handleNewProject}
+              onNewNovelChat={handleNewProjectChat}
               onImportOutline={() => setShowOutlineImporter(true)}
               onSelectNovel={handleSelectProject}
             />
@@ -200,6 +243,7 @@ function App() {
         </div>
       </div>
     </div>
+    </ErrorBoundary>
   );
 }
 

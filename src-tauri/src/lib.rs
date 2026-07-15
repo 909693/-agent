@@ -9,17 +9,159 @@ use llm::client::{LlmClient, LlmConfig};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tauri::Emitter;
 use uuid::Uuid;
+use storage::{
+    log_export_project, log_skill_install, log_skill_remove,
+};
 
 static BATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 static BATCH_CANCEL: AtomicBool = AtomicBool::new(false);
 
+const CHUNKED_PLOT_THRESHOLD: u32 = 60;
+
+#[derive(Clone, Serialize)]
+struct PlotProgress {
+    phase: String,
+    current_act: u32,
+    total_acts: u32,
+    message: String,
+}
+
+/// Truncate string to at most `max` **characters** (not bytes).
+/// Returns a valid UTF-8 substring.
 fn truncate_chars(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
-    let mut end = max;
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s, // string has fewer than max chars
+    }
+}
+
+/// Escape HTML special characters to prevent XSS in exported HTML
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Safe byte-level truncation that respects char boundaries.
+/// Used when we want to limit byte size (e.g., for API payload limits).
+#[allow(dead_code)]
+fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes { return s; }
+    let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) { end -= 1; }
     &s[..end]
+}
+
+/// Sanitize an ID to prevent path traversal. Only allows alphanumeric, dash, underscore.
+#[allow(dead_code)]
+fn sanitize_id(id: &str) -> Result<&str, String> {
+    if id.is_empty() {
+        return Err("ID 不能为空".into());
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') || id.contains('\0') {
+        return Err(format!("无效 ID: {}", id));
+    }
+    Ok(id)
+}
+
+/// Validate base_url to prevent SSRF attacks.
+/// Blocks internal/private IPs, file:// scheme, and non-HTTP(S) protocols.
+fn validate_base_url(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Ok(()); // Empty means use default provider URL
+    }
+
+    // Must start with https:// or http://
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Base URL 必须以 https:// 或 http:// 开头".into());
+    }
+
+    // Parse to extract host
+    let parsed = url::Url::parse(url)
+        .map_err(|_| "无效的 URL 格式".to_string())?;
+
+    let host = parsed.host_str()
+        .ok_or("URL 缺少主机名")?;
+
+    // Block localhost and loopback
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+        return Err("不允许访问本地地址".into());
+    }
+
+    // Block private IP ranges
+    if host.starts_with("10.") || host.starts_with("192.168.") {
+        return Err("不允许访问内网地址".into());
+    }
+
+    // Check 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
+    if host.starts_with("172.") {
+        if let Some(second) = host.split('.').nth(1) {
+            if let Ok(n) = second.parse::<u8>() {
+                if (16..=31).contains(&n) {
+                    return Err("不允许访问内网地址".into());
+                }
+            }
+        }
+    }
+
+    // Block metadata endpoints (cloud SSRF)
+    if host == "169.254.169.254" || host == "metadata.google.internal" {
+        return Err("不允许访问云元数据服务".into());
+    }
+
+    Ok(())
+}
+
+/// Validate data directory path to prevent writing to sensitive system locations.
+fn validate_data_dir(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("目录路径不能为空".into());
+    }
+
+    let path = std::path::Path::new(dir);
+
+    // Must be absolute
+    if !path.is_absolute() {
+        return Err("数据目录必须是绝对路径".into());
+    }
+
+    // Block sensitive system directories
+    let blocked_prefixes = [
+        "/etc", "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+        "/System", "/Library/System", "/var/root",
+        "/private/etc", "/private/var/root",
+    ];
+    #[cfg(windows)]
+    let blocked_prefixes_win = [
+        "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+        "C:\\ProgramData\\Microsoft",
+    ];
+    for prefix in &blocked_prefixes {
+        if dir.starts_with(prefix) {
+            return Err(format!("不允许使用系统目录: {}", prefix));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let dir_upper = dir.to_uppercase();
+        for prefix in &blocked_prefixes_win {
+            if dir_upper.starts_with(&prefix.to_uppercase()) {
+                return Err(format!("不允许使用系统目录: {}", prefix));
+            }
+        }
+    }
+
+    // Block path traversal
+    if dir.contains("..") || dir.contains('\0') {
+        return Err("路径包含非法字符".into());
+    }
+
+    Ok(())
 }
 
 fn build_constraints_text(constraints: Option<&Value>) -> String {
@@ -67,7 +209,7 @@ fn build_constraints_text(constraints: Option<&Value>) -> String {
 // ===== Shared Helpers =====
 
 /// Find chapter outline from plot.json by chapter number
-fn find_chapter_outline(project_id: &str, chapter_number: u32) -> Result<String, String> {
+pub fn find_chapter_outline(project_id: &str, chapter_number: u32) -> Result<String, String> {
     let plot = storage::load_json(project_id, "plot.json")?.unwrap_or(json!({}));
     if let Some(acts) = plot["acts"].as_array() {
         for act in acts {
@@ -90,7 +232,7 @@ fn find_chapter_outline(project_id: &str, chapter_number: u32) -> Result<String,
 
 /// Build rich RAG context string for prompt injection
 /// Uses smart windowing (first 3 + last 10 chapters), character states, foreshadowing
-fn build_rich_context_string(project_id: &str, chapter_number: u32) -> Result<String, String> {
+pub fn build_rich_context_string(project_id: &str, chapter_number: u32) -> Result<String, String> {
     let world = storage::load_json(project_id, "world.json")?.unwrap_or(json!({}));
     let chars = storage::load_json(project_id, "characters.json")?.unwrap_or(json!({}));
     let summaries = storage::load_json(project_id, "chapter_summaries.json")?.unwrap_or(json!({}));
@@ -138,9 +280,31 @@ fn build_rich_context_string(project_id: &str, chapter_number: u32) -> Result<St
         !resolved_foreshadowing.iter().any(|r| f.contains(r))
     });
 
+    // Fallback: if no summaries exist, read raw chapter text for context
+    if prev_summaries.is_empty() && chapter_number > 1 {
+        let start = if chapter_number > 3 { chapter_number - 3 } else { 1 };
+        for ch_num in start..chapter_number {
+            let file = format!("chapter_{:03}.json", ch_num);
+            if let Ok(Some(ch)) = storage::load_json(project_id, &file) {
+                if let Some(text) = ch["text"].as_str() {
+                    if !text.is_empty() {
+                        let chars_count = text.chars().count();
+                        let tail = if chars_count > 800 {
+                            let skip = chars_count - 800;
+                            &text[text.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0)..]
+                        } else {
+                            text
+                        };
+                        prev_summaries.push(format!("第{}章（末尾）：...{}", ch_num, tail));
+                    }
+                }
+            }
+        }
+    }
+
     // Last chapter end_state
     let last_end_state = if chapter_number > 1 {
-        summaries.get(&(chapter_number - 1).to_string())
+        summaries.get((chapter_number - 1).to_string())
             .and_then(|s| s["end_state"].as_str())
             .unwrap_or("")
     } else { "" };
@@ -229,7 +393,36 @@ fn get_data_dir() -> String {
 }
 
 #[tauri::command]
-async fn test_llm(api_format: String, api_key: String, model: String, base_url: String) -> Result<String, String> {
+fn save_llm_config(config: Value) -> Result<(), String> {
+    storage::save_llm_config(&config)
+}
+
+#[tauri::command]
+fn get_llm_config() -> Result<Value, String> {
+    match storage::load_llm_config()? {
+        Some(val) => Ok(val),
+        None => Ok(json!(null)),
+    }
+}
+
+#[tauri::command]
+fn save_llm_profiles(profiles: Value) -> Result<(), String> {
+    storage::save_llm_profiles(&profiles)
+}
+
+#[tauri::command]
+fn get_llm_profiles() -> Result<Value, String> {
+    match storage::load_llm_profiles()? {
+        Some(val) => Ok(val),
+        None => Ok(json!({})),
+    }
+}
+
+#[tauri::command]
+async fn test_llm(api_format: String, api_key: String, model: String, base_url: String, proxy_url: Option<String>) -> Result<String, String> {
+    // Validate base_url to prevent SSRF
+    validate_base_url(&base_url)?;
+
     let model_name = if model.is_empty() { "claude-sonnet-4-20250514".to_string() } else { model };
 
     match api_format.as_str() {
@@ -243,9 +436,15 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
             let body_str = serde_json::to_string_pretty(&body).unwrap_or_default();
 
             // Try x-api-key
-            let r1 = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build().map_err(|e| format!("Client build: {:?}", e))?
+            let mut builder1 = reqwest::Client::builder()
+                .danger_accept_invalid_certs(false)
+                .timeout(Duration::from_secs(60));
+            if let Some(ref proxy) = proxy_url {
+                if let Ok(p) = reqwest::Proxy::all(proxy) {
+                    builder1 = builder1.proxy(p);
+                }
+            }
+            let r1 = builder1.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
@@ -262,9 +461,15 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
             };
 
             // Try Bearer
-            let r2 = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build().map_err(|e| format!("Client build: {:?}", e))?
+            let mut builder2 = reqwest::Client::builder()
+                .danger_accept_invalid_certs(false)
+                .timeout(Duration::from_secs(60));
+            if let Some(ref proxy) = proxy_url {
+                if let Ok(p) = reqwest::Proxy::all(proxy) {
+                    builder2 = builder2.proxy(p);
+                }
+            }
+            let r2 = builder2.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("anthropic-version", "2023-06-01")
@@ -281,7 +486,7 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
             };
 
             Ok(format!("URL: {}\nBody: {}\n\n--- x-api-key ---\nStatus: {}\n{}\n\n--- Bearer ---\nStatus: {}\n{}",
-                url, body_str, status1, &text1[..text1.len().min(500)], status2, &text2[..text2.len().min(500)]))
+                url, body_str, status1, truncate_chars(&text1, 500), status2, truncate_chars(&text2, 500)))
         }
         _ => {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -290,9 +495,15 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Say hi"}]
             });
-            let resp = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build().map_err(|e| format!("Client build: {:?}", e))?
+            let mut builder = reqwest::Client::builder()
+                .danger_accept_invalid_certs(false)
+                .timeout(Duration::from_secs(60));
+            if let Some(ref proxy) = proxy_url {
+                if let Ok(p) = reqwest::Proxy::all(proxy) {
+                    builder = builder.proxy(p);
+                }
+            }
+            let resp = builder.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("content-type", "application/json")
@@ -300,13 +511,16 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
                 .send().await.map_err(|e| format!("Request failed: {:?}", e))?;
             let status = resp.status().to_string();
             let text = resp.text().await.unwrap_or_default();
-            Ok(format!("URL: {}\nStatus: {}\nResponse: {}", url, status, &text[..text.len().min(500)]))
+            Ok(format!("URL: {}\nStatus: {}\nResponse: {}", url, status, truncate_chars(&text, 500)))
         }
     }
 }
 
 #[tauri::command]
 fn set_data_dir(new_dir: String, migrate: bool) -> Result<String, String> {
+    // Validate directory path
+    validate_data_dir(&new_dir)?;
+
     let old_dir = storage::data_dir().to_string_lossy().to_string();
     if migrate && old_dir != new_dir {
         let count = storage::migrate_data(&old_dir, &new_dir)?;
@@ -327,7 +541,16 @@ async fn agent_chat(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
+    // Input validation
+    if message.len() > 10000 {
+        return Err("消息过长（最大 10000 字符）".into());
+    }
+    if history.len() > 100 {
+        return Err("对话历史过长（最多 100 条）".into());
+    }
+
     let meta = storage::load_json(&project_id, "meta.json")?.unwrap_or(json!({}));
     let world = storage::load_json(&project_id, "world.json")?.unwrap_or(json!({}));
     let chars = storage::load_json(&project_id, "characters.json")?.unwrap_or(json!({}));
@@ -361,7 +584,7 @@ async fn agent_chat(
 6. **回答问题**：关于当前小说的任何问题
 
 ## 回复格式
-你的回复必须是 JSON：
+你的回复必须是**纯 JSON**，不要包含任何 markdown 代码块标记或其他文字：
 {{
   "reply": "给用户看的自然语言回复",
   "action": null 或 {{
@@ -369,6 +592,13 @@ async fn agent_chat(
     "params": {{}}
   }}
 }}
+
+## 示例
+用户说"帮我写第一章"，你应该回复：
+{{"reply": "好的，我来帮你扩写第一章，目标 3000 字。", "action": {{"type": "expand_chapter", "params": {{"chapter": 1, "target_words": 3000, "hint": ""}}}}}}
+
+用户说"生成世界观"，你应该回复：
+{{"reply": "好的，我来生成世界观。", "action": {{"type": "generate_world", "params": {{}}}}}}
 
 ## 动作类型列表
 - "generate_world": 生成世界观
@@ -385,36 +615,337 @@ async fn agent_chat(
 - null: 纯对话，无需执行动作
 
 ## 规则
-- 如果用户意图不明确，先追问再执行
-- 生成类操作前要确认
+- 当用户明确表达了要执行某个操作（如"帮我写第一章"、"扩写第二章"、"生成世界观"），你必须在 action 字段返回对应的动作，不要只回复文字而不带 action
+- 前端会显示确认按钮让用户确认执行，所以你不需要自己追问"确认吗？"——直接返回 action 即可
+- 只有当用户意图真的不明确（比如"帮我改改"但没说改哪里）时才追问
 - 回复要简洁友好
-- reply 字段必须是中文"#
+- reply 字段必须是中文
+- action 字段必须严格使用动作类型列表中的 type 值，不要自创类型"#
     );
 
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let mut msgs = history.clone();
     msgs.push(("user".to_string(), message));
 
     let raw = client.chat(&system, &msgs, 4096).await?;
 
-    // Try parse JSON, fallback to plain reply
+    // Try parse JSON from LLM response, with multiple fallback strategies
     let trimmed = raw.trim();
+    // Strategy 1: direct JSON parse
     if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-        Ok(parsed)
-    } else if trimmed.contains("```") {
+        if parsed.get("reply").is_some() {
+            return Ok(parsed);
+        }
+    }
+    // Strategy 2: extract from markdown code block
+    if trimmed.contains("```") {
         let start = trimmed.find("```").unwrap_or(0) + 3;
         let after = &trimmed[start..];
         let content_start = after.find('\n').unwrap_or(0) + 1;
         let end = after.rfind("```").unwrap_or(after.len());
         let json_str = &after[content_start..end];
-        serde_json::from_str(json_str.trim()).unwrap_or_else(|_| json!({"reply": raw, "action": null}));
-        Ok(serde_json::from_str(json_str.trim()).unwrap_or(json!({"reply": raw, "action": null})))
-    } else if let Some(start) = trimmed.find('{') {
-        let end = trimmed.rfind('}').unwrap_or(trimmed.len());
-        Ok(serde_json::from_str(&trimmed[start..=end]).unwrap_or(json!({"reply": raw, "action": null})))
-    } else {
-        Ok(json!({"reply": raw, "action": null}))
+        if let Ok(parsed) = serde_json::from_str::<Value>(json_str.trim()) {
+            if parsed.get("reply").is_some() {
+                return Ok(parsed);
+            }
+        }
     }
+    // Strategy 3: find outermost JSON object containing "reply"
+    if let Some(first_brace) = trimmed.find('{') {
+        let last_brace = trimmed.rfind('}').unwrap_or(trimmed.len());
+        if last_brace > first_brace {
+            let candidate = &trimmed[first_brace..=last_brace];
+            if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
+                if parsed.get("reply").is_some() {
+                    return Ok(parsed);
+                }
+            }
+        }
+    }
+    // Fallback: treat entire response as plain text reply
+    Ok(json!({"reply": raw, "action": null}))
+}
+
+static AGENT_CANCEL: AtomicBool = AtomicBool::new(false);
+
+fn is_prompt_too_long(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("prompt too long")
+        || lower.contains("request too large")
+        || lower.contains("maximum context length")
+        || lower.contains("resource_exhausted")
+        || lower.contains("token limit")
+}
+
+#[tauri::command]
+async fn cancel_agent_chat() -> Result<(), String> {
+    AGENT_CANCEL.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn agent_chat_stream(
+    app: tauri::AppHandle,
+    project_id: String,
+    message: String,
+    history: Vec<serde_json::Value>,
+    constraints: Option<Value>,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+    proxy_url: Option<String>,
+) -> Result<(), String> {
+    use llm::client::{AgentMsg, StreamEvent};
+    use engine::tools;
+
+    if message.len() > 10000 {
+        return Err("消息过长（最大 10000 字符）".into());
+    }
+
+    AGENT_CANCEL.store(false, Ordering::Relaxed);
+
+    let meta = storage::load_json(&project_id, "meta.json")?.unwrap_or(json!({}));
+    let world = storage::load_json(&project_id, "world.json")?.unwrap_or(json!({}));
+    let chars = storage::load_json(&project_id, "characters.json")?.unwrap_or(json!({}));
+    let plot = storage::load_json(&project_id, "plot.json")?.unwrap_or(json!({}));
+
+    let project_context = format!(
+        "标题：{}\n类型：{}\n基调：{}\n前提：{}\n世界观摘要：{}\n角色数：{}\n章节数：{}",
+        meta["title"].as_str().unwrap_or("未设置"),
+        meta["genre"].as_str().unwrap_or("未设置"),
+        meta["tone"].as_str().unwrap_or("未设置"),
+        truncate_chars(meta["premise"].as_str().unwrap_or("未设置"), 500),
+        truncate_chars(world["overview"].as_str().unwrap_or("未生成"), 500),
+        chars["characters"].as_array().map(|a| a.len()).unwrap_or(0),
+        plot["acts"].as_array().map(|a| a.iter().flat_map(|act| act["chapters"].as_array()).flatten().count()).unwrap_or(0),
+    );
+
+    let system = format!(
+        r#"你是 RETL 小说创作智能体助手。你可以通过工具帮用户完成各种小说创作任务。
+
+## 当前项目信息
+{project_context}
+
+## 使用工具的规则
+- 当用户要求写/扩写/续写章节时，直接调用 expand_chapter 或 continue_chapter，不需要先查看大纲或前面章节——这些工具内部会自动获取大纲、前文上下文、角色状态等所有必要信息
+- 重要：当用户要求连续写多章时（如"写第5章和第6章"），必须一章一章按顺序写，每次只调用一个 expand_chapter，等前一章完成后再写下一章。这样后面的章节才能获取到前面章节的上下文，保证情节连贯
+- 当用户要求生成世界观/角色/大纲时，直接调用对应工具
+- 当用户要求查看信息（如"角色有哪些"），调用查询工具获取数据后回答
+- 你可以连续调用多个工具完成复杂任务（如"生成完整框架"可以依次调用 generate_world → generate_characters → generate_plot）
+- 工具执行结果会返回给你，你需要根据结果生成友好的中文回复
+- 用自然、简洁的中文回答用户
+- 尽量减少不必要的工具调用，能一步完成的不要分多步"#
+    );
+
+    let client = std::sync::Arc::new(make_client(&api_format, &api_key, &model, &base_url, proxy_url));
+    let tool_defs = tools::get_tool_definitions();
+
+    // Build conversation from history + new message
+    let mut conversation: Vec<AgentMsg> = Vec::new();
+    for msg_val in &history {
+        let role = msg_val["role"].as_str().unwrap_or("user");
+        let content = msg_val["content"].as_str().unwrap_or("");
+        match role {
+            "user" => conversation.push(AgentMsg::User { content: content.to_string() }),
+            "assistant" => conversation.push(AgentMsg::Assistant {
+                text: content.to_string(),
+                tool_uses: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+    conversation.push(AgentMsg::User { content: message });
+
+    let max_iterations = 10;
+    let constraints_text = build_constraints_text(constraints.as_ref());
+    eprintln!("[Agent] constraints_text length: {} chars", constraints_text.chars().count());
+    let max_context_tokens: usize = 20000;
+
+    for iteration in 0..max_iterations {
+        // Compact conversation if too long
+        let send_msgs = engine::context::compact_conversation(&conversation, max_context_tokens);
+
+        if AGENT_CANCEL.load(Ordering::Relaxed) {
+            let _ = app.emit("agent_event", StreamEvent::Error { error: "已取消".into() });
+            return Ok(());
+        }
+
+        eprintln!("[Agent] Iteration {}/{}", iteration + 1, max_iterations);
+
+        let app_clone = app.clone();
+        let response = client.chat_with_tools_stream(
+            &system,
+            &send_msgs,
+            &tool_defs,
+            4096,
+            move |delta| {
+                let _ = app_clone.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
+            },
+        ).await;
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                if is_prompt_too_long(&e) {
+                    eprintln!("[Agent] Prompt too long, attempting aggressive compaction...");
+                    let compact_msgs = engine::context::aggressive_compact(&conversation, max_context_tokens);
+                    let app_retry = app.clone();
+                    let retry = client.chat_with_tools_stream(
+                        &system, &compact_msgs, &tool_defs, 4096,
+                        move |delta| {
+                            let _ = app_retry.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
+                        },
+                    ).await;
+                    match retry {
+                        Ok(r) => r,
+                        Err(e2) => {
+                            let _ = app.emit("agent_event", StreamEvent::Error {
+                                error: format!("上下文过长，压缩后仍然失败: {}", e2),
+                            });
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    let _ = app.emit("agent_event", StreamEvent::Error { error: e });
+                    return Ok(());
+                }
+            }
+        };
+
+        // Max output tokens recovery: auto-continue if truncated
+        let mut final_response = response;
+        if final_response.stop_reason.as_deref() == Some("max_tokens") && final_response.tool_uses.is_empty() {
+            for cont in 0..3u32 {
+                eprintln!("[Agent] Output truncated (continuation {}/3), requesting more...", cont + 1);
+                conversation.push(AgentMsg::Assistant {
+                    text: final_response.text.clone(),
+                    tool_uses: Vec::new(),
+                });
+                conversation.push(AgentMsg::User {
+                    content: "你的输出被截断了，请从断点继续。不要重复已输出的内容。".into(),
+                });
+                let cont_msgs = engine::context::compact_conversation(&conversation, max_context_tokens);
+                let app_cont = app.clone();
+                let cont_resp = client.chat_with_tools_stream(
+                    &system, &cont_msgs, &tool_defs, 4096,
+                    move |delta| {
+                        let _ = app_cont.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
+                    },
+                ).await;
+                conversation.pop(); // remove temp user msg
+                conversation.pop(); // remove temp assistant msg
+                match cont_resp {
+                    Ok(r) => {
+                        final_response.text.push_str(&r.text);
+                        final_response.tool_uses = r.tool_uses;
+                        final_response.stop_reason = r.stop_reason;
+                        if final_response.stop_reason.as_deref() != Some("max_tokens") || !final_response.tool_uses.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Add assistant response to conversation
+        conversation.push(AgentMsg::Assistant {
+            text: final_response.text.clone(),
+            tool_uses: final_response.tool_uses.clone(),
+        });
+
+        // If no tool calls, we're done
+        if final_response.tool_uses.is_empty() {
+            let _ = app.emit("agent_event", StreamEvent::Done { reply: final_response.text });
+            return Ok(());
+        }
+
+        // Execute tools — read-only tools run concurrently, write tools run sequentially
+        if AGENT_CANCEL.load(Ordering::Relaxed) {
+            let _ = app.emit("agent_event", StreamEvent::Error { error: "已取消".into() });
+            return Ok(());
+        }
+
+        let (read_only, write): (Vec<_>, Vec<_>) = final_response.tool_uses.iter()
+            .partition(|tc| tools::is_tool_read_only(&tc.name));
+
+        // Emit all ToolCall events upfront
+        for tc in read_only.iter().chain(write.iter()) {
+            let _ = app.emit("agent_event", StreamEvent::ToolCall {
+                id: tc.id.clone(), name: tc.name.clone(), input: tc.input.clone(),
+            });
+        }
+
+        // Run read-only tools concurrently
+        if !read_only.is_empty() {
+            let read_futures: Vec<_> = read_only.iter().map(|tc| {
+                let name = tc.name.clone();
+                let input = tc.input.clone();
+                let id = tc.id.clone();
+                let pid = project_id.clone();
+                let ct = constraints_text.clone();
+                let cl = client.clone();
+                async move {
+                    let result = tools::execute_tool(&name, &input, &pid, &cl, &ct).await;
+                    (id, name, result)
+                }
+            }).collect();
+
+            let results = futures_util::future::join_all(read_futures).await;
+            for (id, name, result) in results {
+                let (success, result_str) = match &result {
+                    Ok(v) => (true, serde_json::to_string_pretty(v).unwrap_or_default()),
+                    Err(e) => (false, format!("错误: {}", e)),
+                };
+                let display_result = if result_str.chars().count() > 500 {
+                    format!("{}...", result_str.chars().take(500).collect::<String>())
+                } else { result_str.clone() };
+                let _ = app.emit("agent_event", StreamEvent::ToolResult {
+                    name: name.clone(), success, result: display_result,
+                });
+                let llm_result = if result_str.chars().count() > 1000 {
+                    format!("{}...(已截断)", result_str.chars().take(1000).collect::<String>())
+                } else { result_str };
+                conversation.push(AgentMsg::ToolResultMsg { tool_use_id: id, content: llm_result });
+            }
+        }
+
+        // Run write tools sequentially
+        for tool_call in &write {
+            if AGENT_CANCEL.load(Ordering::Relaxed) {
+                let _ = app.emit("agent_event", StreamEvent::Error { error: "已取消".into() });
+                return Ok(());
+            }
+            let result = tools::execute_tool(
+                &tool_call.name, &tool_call.input, &project_id, &client, &constraints_text,
+            ).await;
+            let (success, result_str) = match &result {
+                Ok(v) => (true, serde_json::to_string_pretty(v).unwrap_or_default()),
+                Err(e) => (false, format!("错误: {}", e)),
+            };
+            let display_result = if result_str.chars().count() > 500 {
+                format!("{}...", result_str.chars().take(500).collect::<String>())
+            } else { result_str.clone() };
+            let _ = app.emit("agent_event", StreamEvent::ToolResult {
+                name: tool_call.name.clone(), success, result: display_result,
+            });
+            let llm_result = if result_str.chars().count() > 1000 {
+                format!("{}...(已截断)", result_str.chars().take(1000).collect::<String>())
+            } else { result_str };
+            conversation.push(AgentMsg::ToolResultMsg {
+                tool_use_id: tool_call.id.clone(), content: llm_result,
+            });
+        }
+        // Continue loop to let LLM process tool results
+    }
+
+    let _ = app.emit("agent_event", StreamEvent::Done {
+        reply: "已达到最大迭代次数。".into(),
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -426,8 +957,17 @@ async fn chat_with_ai(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<String, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    // Input validation
+    if messages.len() > 100 {
+        return Err("对话历史过长（最多 100 条）".into());
+    }
+    if genre.len() > 50 {
+        return Err("类型名称过长".into());
+    }
+
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let constraints_raw = build_constraints_text(constraints.as_ref());
     let constraints_text = truncate_chars(&constraints_raw, 2000);
     let system = format!(
@@ -471,8 +1011,9 @@ async fn extract_framework(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let system = format!("你是一位专业的小说策划师。请根据之前的对话内容，提取并整理出完整的小说框架。输出严格的 JSON 格式。\n\n{}", constraints_text);
     let mut msgs = messages.clone();
@@ -558,6 +1099,7 @@ async fn get_project(project_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 async fn save_outline_source(project_id: String, outline: Value) -> Result<Value, String> {
+    validate_json_size(&outline, "大纲")?;
     storage::save_json(&project_id, "outline_source.json", &outline)?;
     Ok(outline)
 }
@@ -579,6 +1121,7 @@ async fn list_skills() -> Result<Value, String> {
 
 #[tauri::command]
 async fn install_skill_repo(repo_url: String) -> Result<Value, String> {
+    log_skill_install(&repo_url);
     plugins::install_skill_repo(repo_url)
 }
 
@@ -594,6 +1137,7 @@ async fn toggle_skill_repo(skill_id: String, enabled: bool) -> Result<Value, Str
 
 #[tauri::command]
 async fn remove_skill_repo(skill_id: String) -> Result<(), String> {
+    log_skill_remove(&skill_id);
     plugins::remove_skill_repo(skill_id)
 }
 
@@ -647,7 +1191,7 @@ async fn get_mcp_logs(server_id: String) -> Result<String, String> {
     plugins::get_mcp_logs(server_id)
 }
 
-fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str) -> LlmClient {
+fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, proxy_url: Option<String>) -> LlmClient {
     let default_model = match api_format {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
@@ -663,6 +1207,8 @@ fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str) -> 
             model.to_string()
         },
         base_url: base_url.to_string(),
+        proxy_url,
+        accept_invalid_certs: false, // Default to secure mode
     })
 }
 
@@ -674,10 +1220,11 @@ async fn generate_world(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let premise = meta["premise"].as_str().unwrap_or("");
     let genre = meta["genre"].as_str().unwrap_or("");
@@ -707,8 +1254,21 @@ async fn get_world(project_id: String) -> Result<Value, String> {
     storage::load_json(&project_id, "world.json")?.ok_or_else(|| "World not generated yet".into())
 }
 
+/// Max allowed size for user-submitted JSON data (5MB)
+const MAX_JSON_PAYLOAD_SIZE: usize = 5_000_000;
+
+/// Validate JSON payload size to prevent memory exhaustion
+fn validate_json_size(data: &Value, label: &str) -> Result<(), String> {
+    let size = serde_json::to_string(data).map(|s| s.len()).unwrap_or(0);
+    if size > MAX_JSON_PAYLOAD_SIZE {
+        return Err(format!("{} 数据过大（最大 5MB）", label));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn save_world_data(project_id: String, world: Value) -> Result<Value, String> {
+    validate_json_size(&world, "世界观")?;
     storage::save_json(&project_id, "world.json", &world)?;
     Ok(world)
 }
@@ -721,11 +1281,12 @@ async fn generate_characters(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let world = storage::load_json(&project_id, "world.json")?.ok_or("Generate world first")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "overview": world["overview"],
@@ -737,7 +1298,7 @@ async fn generate_characters(
         &format!("{}\n\n{}\n\n## 已导入大纲\n{}", constraints_text, meta["premise"].as_str().unwrap_or(""), truncate_chars(&serde_json::to_string_pretty(&outline_source).unwrap_or_default(), 3000)),
         meta["genre"].as_str().unwrap_or(""),
         meta["tone"].as_str().unwrap_or(""),
-        &format!("{}\n\n{}", constraints_text, world_summary),
+        &world_summary,
     )
     .await?;
     storage::save_json(&project_id, "characters.json", &chars)?;
@@ -752,40 +1313,249 @@ async fn get_characters(project_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 async fn save_characters_data(project_id: String, characters: Value) -> Result<Value, String> {
+    validate_json_size(&characters, "角色")?;
     storage::save_json(&project_id, "characters.json", &characters)?;
     Ok(characters)
 }
 
+async fn generate_act_chapters_with_retry(
+    client: &LlmClient,
+    act_number: u32,
+    act_title: &str,
+    act_theme: &str,
+    act_key_events: &str,
+    act_end_state: &str,
+    chapter_start: u32,
+    chapter_end: u32,
+    story_context: &str,
+    prev_act_summary: &str,
+    next_act_summary: &str,
+    plot_points_json: &str,
+) -> Result<Value, String> {
+    // Try once; on failure, retry once with a slight delay
+    match engine::generate_act_chapters(
+        client, act_number, act_title, act_theme, act_key_events, act_end_state,
+        chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
+    ).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            eprintln!("[generate_act_chapters_with_retry] Retry after error: {}", e);
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            engine::generate_act_chapters(
+                client, act_number, act_title, act_theme, act_key_events, act_end_state,
+                chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
+            ).await
+        }
+    }
+}
+
+async fn generate_plot_chunked(
+    app: &tauri::AppHandle,
+    client: &LlmClient,
+    premise: &str,
+    genre: &str,
+    tone: &str,
+    world_summary: &str,
+    characters_summary: &str,
+    target_chapters: u32,
+) -> Result<Value, String> {
+    let _ = app.emit("plot_progress", PlotProgress {
+        phase: "skeleton".into(),
+        current_act: 0,
+        total_acts: 0,
+        message: format!("正在生成 {} 章的故事骨架...", target_chapters),
+    });
+
+    let skeleton = engine::generate_plot_skeleton(
+        client, premise, genre, tone, world_summary, characters_summary, target_chapters,
+    ).await?;
+
+    let acts = skeleton["acts"].as_array()
+        .ok_or("骨架生成失败：未返回 acts 数组")?;
+    let total_acts_count = acts.len() as u32;
+    eprintln!("[generate_plot_chunked] Phase 1 done: {} acts, target {} chapters", total_acts_count, target_chapters);
+
+    // Compute exact chapter ranges in code: divide target_chapters by act count
+    // Extra chapters (remainder) are distributed to the first N acts
+    let base_chapters = target_chapters / total_acts_count;
+    let remainder = target_chapters % total_acts_count;
+    let plot_points_json = serde_json::to_string(&skeleton["plot_points"]).unwrap_or("[]".into());
+    let story_context = format!(
+        "前提：{}\n类型：{}\n基调：{}\n世界观：{}\n角色：{}",
+        truncate_chars(premise, 500), genre, tone,
+        truncate_chars(world_summary, 500), truncate_chars(characters_summary, 500)
+    );
+
+    let mut merged_acts: Vec<Value> = Vec::new();
+
+    for (idx, act) in acts.iter().enumerate() {
+        let act_num = act["number"].as_u64().unwrap_or((idx + 1) as u64) as u32;
+        let act_title = act["title"].as_str().unwrap_or("");
+        let act_theme = act["theme"].as_str().unwrap_or("");
+        let act_key_events = serde_json::to_string(&act["key_events"]).unwrap_or("[]".into());
+        let act_end_state = act["end_state"].as_str().unwrap_or("");
+
+        // Compute chapter range from code: distribute chapters evenly
+        // Earlier acts get +1 chapter if there's a remainder
+        let ch_count = if (idx as u32) < remainder { base_chapters + 1 } else { base_chapters };
+        let mut chapter_start = 1u32;
+        for i in 0..idx {
+            let extra = if (i as u32) < remainder { 1 } else { 0 };
+            chapter_start += base_chapters + extra;
+        }
+        let chapter_end = chapter_start + ch_count - 1;
+
+        let prev_summary = if idx > 0 {
+            let prev = &acts[idx - 1];
+            format!("前一幕：{}（{}）- 结局状态：{}",
+                prev["title"].as_str().unwrap_or(""),
+                prev["theme"].as_str().unwrap_or(""),
+                prev["end_state"].as_str().unwrap_or(""))
+        } else { String::new() };
+
+        let next_summary = if idx + 1 < acts.len() {
+            let next = &acts[idx + 1];
+            format!("后一幕：{}（{}）",
+                next["title"].as_str().unwrap_or(""),
+                next["theme"].as_str().unwrap_or(""))
+        } else { String::new() };
+
+        let _ = app.emit("plot_progress", PlotProgress {
+            phase: "act_details".into(),
+            current_act: (idx + 1) as u32,
+            total_acts: total_acts_count,
+            message: format!("正在生成第 {} 幕章节详情（第 {}-{} 章）...", act_num, chapter_start, chapter_end),
+        });
+
+        // Sub-chunk large acts to fit within provider output limits (~16384 tokens max)
+        // At ~600 tokens/chapter, each chunk fits ~22 chapters
+        let act_chapters_count = chapter_end - chapter_start + 1;
+        let chunk_size = 22;
+        let all_chapters: Vec<Value> = if act_chapters_count <= chunk_size {
+            // Small act: single call
+            let result = generate_act_chapters_with_retry(
+                client, act_num, act_title, act_theme, &act_key_events, act_end_state,
+                chapter_start, chapter_end, &story_context, &prev_summary, &next_summary, &plot_points_json,
+            ).await;
+            match result {
+                Ok(data) => data["chapters"].as_array().cloned().unwrap_or_default(),
+                Err(e) => { eprintln!("[generate_plot_chunked] Act {} failed: {}", act_num, e); Vec::new() }
+            }
+        } else {
+            // Large act: split into sub-chunks
+            let mut chunks: Vec<Value> = Vec::new();
+            let mut sub_start = chapter_start;
+            let mut sub_idx = 0;
+            while sub_start <= chapter_end {
+                sub_idx += 1;
+                let sub_end = (sub_start + chunk_size - 1).min(chapter_end);
+                let sub_num = sub_end - sub_start + 1;
+                if sub_idx > 1 {
+                    // Small delay between sub-chunks to avoid rate limiting
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                let result = generate_act_chapters_with_retry(
+                    client, act_num, act_title, act_theme, &act_key_events, act_end_state,
+                    sub_start, sub_end, &story_context, &prev_summary, &next_summary, &plot_points_json,
+                ).await;
+                match result {
+                    Ok(data) => {
+                        if let Some(c) = data["chapters"].as_array() {
+                            let got = c.len();
+                            eprintln!("[generate_plot_chunked] Act {} sub-chunk {}/{} (ch {}-{}) got {}/{} chapters",
+                                act_num, sub_idx, (act_chapters_count + chunk_size - 1) / chunk_size, sub_start, sub_end, got, sub_num);
+                            chunks.extend(c.iter().cloned());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[generate_plot_chunked] Act {} sub-chunk {}/{} failed: {}", act_num, sub_idx, (act_chapters_count + chunk_size - 1) / chunk_size, e);
+                    }
+                }
+                sub_start = sub_end + 1;
+            }
+            chunks
+        };
+
+        let expected = (chapter_end - chapter_start + 1) as usize;
+        if all_chapters.len() < expected {
+            eprintln!("[generate_plot_chunked] Act {} got {}/{} chapters", act_num, all_chapters.len(), expected);
+        }
+
+        merged_acts.push(json!({
+            "number": act_num,
+            "title": act_title,
+            "theme": act_theme,
+            "chapters": all_chapters,
+        }));
+    }
+
+    let _ = app.emit("plot_progress", PlotProgress {
+        phase: "done".into(),
+        current_act: total_acts_count,
+        total_acts: total_acts_count,
+        message: "大纲生成完成".into(),
+    });
+
+    let final_plot = json!({
+        "acts": merged_acts,
+        "plot_points": skeleton["plot_points"],
+        "subplots": skeleton["subplots"],
+    });
+
+    eprintln!("[generate_plot_chunked] Done: {} acts merged", merged_acts.len());
+    Ok(final_plot)
+}
+
 #[tauri::command]
 async fn generate_plot(
+    app: tauri::AppHandle,
     project_id: String,
     constraints: Option<Value>,
+    target_chapters: Option<u32>,
     api_format: String,
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
+    eprintln!("[generate_plot] proxy_url = {:?}", proxy_url);
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let world = storage::load_json(&project_id, "world.json")?.ok_or("Generate world first")?;
     let chars =
         storage::load_json(&project_id, "characters.json")?.ok_or("Generate characters first")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url.clone());
     let constraints_text = build_constraints_text(constraints.as_ref());
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "overview": world["overview"]
     }))
     .unwrap_or_default();
     let chars_summary = serde_json::to_string(&chars["characters"]).unwrap_or_default();
-    let plot = engine::generate_plot(
-        &client,
-        &format!("{}\n\n{}\n\n## 已导入大纲\n{}", constraints_text, meta["premise"].as_str().unwrap_or(""), truncate_chars(&serde_json::to_string_pretty(&outline_source).unwrap_or_default(), 3000)),
-        meta["genre"].as_str().unwrap_or(""),
-        meta["tone"].as_str().unwrap_or(""),
-        &format!("{}\n\n{}", constraints_text, world_summary),
-        &format!("{}\n\n{}", constraints_text, chars_summary),
-    )
-    .await?;
+
+    let chapters = target_chapters.unwrap_or(50);
+    let premise_text = format!(
+        "{}\n\n{}\n\n## 已导入大纲\n{}",
+        constraints_text,
+        meta["premise"].as_str().unwrap_or(""),
+        truncate_chars(&serde_json::to_string_pretty(&outline_source).unwrap_or_default(), 3000)
+    );
+
+    let plot = if chapters > CHUNKED_PLOT_THRESHOLD {
+        generate_plot_chunked(
+            &app, &client, &premise_text,
+            meta["genre"].as_str().unwrap_or(""),
+            meta["tone"].as_str().unwrap_or(""),
+            &world_summary, &chars_summary, chapters,
+        ).await?
+    } else {
+        engine::generate_plot(
+            &client, &premise_text,
+            meta["genre"].as_str().unwrap_or(""),
+            meta["tone"].as_str().unwrap_or(""),
+            &world_summary, &chars_summary, target_chapters,
+        ).await?
+    };
+
     storage::save_json(&project_id, "plot.json", &plot)?;
     Ok(plot)
 }
@@ -797,6 +1567,7 @@ async fn get_plot(project_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 async fn save_plot_outline(project_id: String, plot: Value) -> Result<Value, String> {
+    validate_json_size(&plot, "情节大纲")?;
     storage::save_json(&project_id, "plot.json", &plot)?;
     Ok(plot)
 }
@@ -808,10 +1579,11 @@ async fn generate_timeline(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     let world = storage::load_json(&project_id, "world.json")?.ok_or("Generate world first")?;
     let plot = storage::load_json(&project_id, "plot.json")?.ok_or("Generate plot first")?;
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let plot_summary = serde_json::to_string(&plot["acts"]).unwrap_or_default();
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "history": world["history"]
@@ -839,7 +1611,19 @@ async fn expand_chapter(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
+    // Input validation
+    if chapter_number == 0 || chapter_number > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+    if target_words == 0 || target_words > 50000 {
+        return Err("目标字数必须在 1-50000 范围内".into());
+    }
+    if user_content.len() > 100000 {
+        return Err("输入内容过长（最大 100000 字符）".into());
+    }
+
     let chapter_outline = find_chapter_outline(&project_id, chapter_number)?;
     let mut context = build_rich_context_string(&project_id, chapter_number)?;
     // Inject style profile if available
@@ -850,7 +1634,7 @@ async fn expand_chapter(
     }
     let constraints_text = build_constraints_text(constraints.as_ref());
 
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let result = engine::expand_chapter(
         &client,
         &format!("{}\n\n{}", truncate_chars(&constraints_text, 2000), chapter_outline),
@@ -882,7 +1666,19 @@ async fn continue_writing(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
+    // Input validation
+    if chapter_number == 0 || chapter_number > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+    if target_words == 0 || target_words > 50000 {
+        return Err("目标字数必须在 1-50000 范围内".into());
+    }
+    if instruction.len() > 10000 {
+        return Err("指令过长（最大 10000 字符）".into());
+    }
+
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
     let existing = storage::load_json(&project_id, &chapter_file)?
         .ok_or("Chapter not found, use expand first")?;
@@ -894,9 +1690,18 @@ async fn continue_writing(
             context.push_str(&format!("\n\n## 作者文风\n{}", summary));
         }
     }
-    let constraints_text = build_constraints_text(constraints.as_ref());    let client = make_client(&api_format, &api_key, &model, &base_url);
-    // Truncate existing text to last 2000 chars to avoid token overflow
-    let existing_tail = if existing_text.len() > 2000 { &existing_text[existing_text.len()-2000..] } else { existing_text };
+    let constraints_text = build_constraints_text(constraints.as_ref());
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    // Truncate existing text to last ~2000 characters to avoid token overflow
+    let existing_tail = {
+        let chars_count = existing_text.chars().count();
+        if chars_count > 2000 {
+            let skip = chars_count - 2000;
+            &existing_text[existing_text.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0)..]
+        } else {
+            existing_text
+        }
+    };
     let result = engine::continue_writing(
         &client,
         existing_tail,
@@ -906,7 +1711,7 @@ async fn continue_writing(
     )
     .await?;
     // Append to existing chapter
-    let new_text = format!("{}{}", existing_text, result["text"].as_str().unwrap_or(""));
+    let new_text = format!("{}\n\n{}", existing_text, result["text"].as_str().unwrap_or(""));
     let updated = json!({"text": new_text});
     storage::save_json(&project_id, &chapter_file, &updated)?;
     Ok(updated)
@@ -914,6 +1719,14 @@ async fn continue_writing(
 
 #[tauri::command]
 async fn save_chapter(project_id: String, chapter_number: u32, text: String) -> Result<(), String> {
+    // Input validation
+    if chapter_number == 0 || chapter_number > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+    if text.len() > 500000 {
+        return Err("章节内容过长（最大 500000 字符）".into());
+    }
+
     // Auto-snapshot before overwriting
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
     if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
@@ -927,6 +1740,11 @@ async fn save_chapter(project_id: String, chapter_number: u32, text: String) -> 
 
 #[tauri::command]
 async fn get_chapter(project_id: String, chapter_number: u32) -> Result<Value, String> {
+    // Input validation
+    if chapter_number == 0 || chapter_number > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
     storage::load_json(&project_id, &chapter_file)?.ok_or_else(|| "Chapter not found".into())
 }
@@ -943,7 +1761,22 @@ async fn rewrite_selection(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
+    // Input validation
+    if chapter_number == 0 || chapter_number > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+    if target_delta > 10000 {
+        return Err("目标增量必须在 0-10000 范围内".into());
+    }
+    if selected_text.len() > 50000 {
+        return Err("选中文本过长（最大 50000 字符）".into());
+    }
+    if instruction.len() > 5000 {
+        return Err("指令过长（最大 5000 字符）".into());
+    }
+
     let chapter_outline = find_chapter_outline(&project_id, chapter_number).unwrap_or_default();
     let world = storage::load_json(&project_id, "world.json")?.unwrap_or(json!({}));
     let chars = storage::load_json(&project_id, "characters.json")?.unwrap_or(json!({}));
@@ -956,7 +1789,7 @@ async fn rewrite_selection(
         truncate_chars(&raw, 3000).to_string()
     };
     let constraints_text = build_constraints_text(constraints.as_ref());
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     // Truncate selected_text to prevent overflow
     let selected_truncated = truncate_chars(&selected_text, 3000);
     let system = "你是一位专业小说编辑。你的任务是只重写用户选中的局部片段，在保持上下文一致的前提下进行补写增强。只输出 JSON。";
@@ -982,8 +1815,9 @@ async fn summarize_chapter(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     auto_summarize_and_save(&client, &project_id, chapter_number).await
 }
 
@@ -1050,11 +1884,15 @@ async fn build_chapter_context(
     });
 
     // Get last chapter's end_state for continuity
-    let prev_key = (chapter_number - 1).to_string();
-    let last_end_state = summaries.get(&prev_key)
-        .and_then(|s| s["end_state"].as_str())
-        .unwrap_or("")
-        .to_string();
+    let last_end_state = if chapter_number > 1 {
+        let prev_key = (chapter_number - 1).to_string();
+        summaries.get(&prev_key)
+            .and_then(|s| s["end_state"].as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
 
     // Build compact world + character context
     let world_brief = truncate_chars(world["overview"].as_str().unwrap_or(""), 500);
@@ -1105,6 +1943,7 @@ async fn review_chapter(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<String, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let genre = meta["genre"].as_str().unwrap_or("未知");
@@ -1161,7 +2000,7 @@ async fn review_chapter(
         constraints_text
     );
 
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let msgs = vec![("user".to_string(), user)];
     client.chat(system, &msgs, 8192).await
 }
@@ -1201,14 +2040,40 @@ async fn batch_generate_chapters(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<(), String> {
+    // Input validation BEFORE acquiring lock
+    if start_chapter == 0 || end_chapter == 0 || start_chapter > end_chapter {
+        return Err("无效的章节范围".into());
+    }
+    if end_chapter - start_chapter > 100 {
+        return Err("批量生成最多支持 100 章".into());
+    }
+    if target_words == 0 || target_words > 50000 {
+        return Err("目标字数必须在 1-50000 范围内".into());
+    }
+
+    // Validate project exists before acquiring lock
+    storage::load_json(&project_id, "meta.json")?
+        .ok_or("Project not found")?;
+
     if BATCH_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return Err("批量生成已在运行中".into());
     }
+
+    // RAII guard to ensure BATCH_RUNNING is reset on early return
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            BATCH_RUNNING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = ResetGuard;
+
     BATCH_CANCEL.store(false, Ordering::SeqCst);
 
     let constraints_clone = constraints.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let start_time = std::time::Instant::now();
         let total = end_chapter - start_chapter + 1;
         let mut completed = 0u32;
@@ -1217,7 +2082,7 @@ async fn batch_generate_chapters(
         let mut total_word_count = 0u32;
         let mut failed_chapters: Vec<u32> = Vec::new();
 
-        let client = make_client(&api_format, &api_key, &model, &base_url);
+        let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
 
         for (idx, chapter_number) in (start_chapter..=end_chapter).enumerate() {
             // Check cancel
@@ -1238,7 +2103,7 @@ async fn batch_generate_chapters(
                         skipped += 1;
                         let _ = app.emit("batch_progress", BatchProgress {
                             current: idx as u32 + 1, total, chapter_number,
-                            phase: "skipped".to_string(), word_count: text.len() as u32, error: String::new(),
+                            phase: "skipped".to_string(), word_count: text.chars().count() as u32, error: String::new(),
                         });
                         continue;
                     }
@@ -1306,7 +2171,7 @@ async fn batch_generate_chapters(
                         continue;
                     }
 
-                    let word_count = chapter_data["text"].as_str().map(|t| t.len() as u32).unwrap_or(0);
+                    let word_count = chapter_data["text"].as_str().map(|t| t.chars().count() as u32).unwrap_or(0);
                     total_word_count += word_count;
 
                     // Phase: summarizing
@@ -1351,6 +2216,19 @@ async fn batch_generate_chapters(
         BATCH_RUNNING.store(false, Ordering::SeqCst);
     });
 
+    // Forget guard - task will reset BATCH_RUNNING on completion
+    std::mem::forget(_guard);
+
+    // Spawn a watcher to ensure BATCH_RUNNING is reset even if the task panics
+    tokio::spawn(async move {
+        let result = handle.await;
+        // Always reset BATCH_RUNNING, whether task succeeded or panicked
+        BATCH_RUNNING.store(false, Ordering::SeqCst);
+        if let Err(e) = result {
+            eprintln!("Batch generation task panicked: {:?}", e);
+        }
+    });
+
     Ok(())
 }
 
@@ -1367,6 +2245,7 @@ async fn check_consistency(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     let summaries = storage::load_json(&project_id, "chapter_summaries.json")?.unwrap_or(json!({}));
     if summaries.as_object().map(|o| o.is_empty()).unwrap_or(true) {
@@ -1386,7 +2265,7 @@ async fn check_consistency(
         }).collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
 
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     engine::check_consistency(&client, &truncate_chars(&summaries_str, 6000), &world_str, &chars_str).await
 }
 
@@ -1424,15 +2303,27 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
     if query.is_empty() {
         return Ok(json!([]));
     }
+    // Input validation
+    if query.len() > 200 {
+        return Err("搜索关键词过长（最大 200 字符）".into());
+    }
+
     let query_lower = query.to_lowercase();
     let plot = storage::load_json(&project_id, "plot.json")?.unwrap_or(json!({}));
 
     let mut results: Vec<Value> = Vec::new();
     let mut total_matches = 0u32;
 
+    // Timeout guard
+    let search_start = std::time::Instant::now();
+    let search_timeout = std::time::Duration::from_secs(10);
+
     // Scan all chapter files
-    for num in 1..=500u32 {
+    for num in 1..=999u32 {
         if total_matches >= 100 { break; }
+        if search_start.elapsed() > search_timeout {
+            break; // Graceful timeout instead of error
+        }
         let file = format!("chapter_{:03}.json", num);
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
             if let Some(text) = ch["text"].as_str() {
@@ -1441,13 +2332,14 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
                 let mut start = 0;
                 while let Some(pos) = text_lower[start..].find(&query_lower) {
                     let abs_pos = start + pos;
-                    let ctx_start = abs_pos.saturating_sub(30);
-                    let ctx_end = (abs_pos + query.len() + 30).min(text.len());
-                    // Safe char boundaries
-                    let mut cs = ctx_start;
-                    while cs > 0 && !text.is_char_boundary(cs) { cs -= 1; }
-                    let mut ce = ctx_end;
-                    while ce < text.len() && !text.is_char_boundary(ce) { ce += 1; }
+                    // Use char-based context window (~30 chars each side)
+                    let char_pos = text[..abs_pos].chars().count();
+                    let total_chars = text.chars().count();
+                    let ctx_char_start = char_pos.saturating_sub(30);
+                    let query_char_len = query.chars().count();
+                    let ctx_char_end = (char_pos + query_char_len + 30).min(total_chars);
+                    let cs = text.char_indices().nth(ctx_char_start).map(|(i, _)| i).unwrap_or(0);
+                    let ce = text.char_indices().nth(ctx_char_end).map(|(i, _)| i).unwrap_or(text.len());
                     matches.push(json!({
                         "offset": abs_pos,
                         "context": &text[cs..ce],
@@ -1474,7 +2366,7 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
                 }
             }
         } else {
-            break; // No more chapters
+            continue; // Gap in chapter numbering, keep scanning
         }
     }
     Ok(json!(results))
@@ -1491,10 +2383,11 @@ async fn simulate_reader(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     let chapter_outline = find_chapter_outline(&project_id, chapter_number).unwrap_or_default();
     let context = build_rich_context_string(&project_id, chapter_number)?;
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let truncated = truncate_chars(&chapter_text, 8000);
     engine::simulate_reader(&client, truncated, &chapter_outline, &truncate_chars(&context, 2000)).await
 }
@@ -1506,10 +2399,11 @@ async fn analyze_writing_style(
     api_key: String,
     model: String,
     base_url: String,
+    proxy_url: Option<String>,
 ) -> Result<Value, String> {
     // Collect up to 5 written chapters as samples
     let mut samples = Vec::new();
-    for num in 1..=100u32 {
+    for num in 1..=999u32 {
         if samples.len() >= 5 { break; }
         let file = format!("chapter_{:03}.json", num);
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
@@ -1524,7 +2418,7 @@ async fn analyze_writing_style(
         return Err("至少需要 3 章已写内容才能分析文风".into());
     }
     let combined = samples.join("\n\n");
-    let client = make_client(&api_format, &api_key, &model, &base_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
     let result = engine::analyze_style(&client, &combined).await?;
 
     // Save style profile
@@ -1539,12 +2433,97 @@ async fn get_style_profile(project_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn sync_outline_from_chapter(
+    project_id: String,
+    chapter_number: u32,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+    proxy_url: Option<String>,
+) -> Result<Value, String> {
+    let chapter_file = format!("chapter_{:03}.json", chapter_number);
+    let chapter = storage::load_json(&project_id, &chapter_file)?.ok_or("章节不存在")?;
+    let chapter_text = chapter["text"].as_str().unwrap_or("");
+    if chapter_text.is_empty() { return Err("章节内容为空".into()); }
+
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let result = engine::sync_outline(&client, chapter_text, chapter_number).await?;
+    let new_summary = result["summary"].as_str().unwrap_or("");
+
+    // Update plot.json
+    if let Ok(Some(mut plot)) = storage::load_json(&project_id, "plot.json") {
+        if let Some(acts) = plot["acts"].as_array_mut() {
+            for act in acts.iter_mut() {
+                if let Some(chapters) = act["chapters"].as_array_mut() {
+                    for ch in chapters.iter_mut() {
+                        if ch["number"].as_u64() == Some(chapter_number as u64) {
+                            ch["summary"] = json!(new_summary);
+                        }
+                    }
+                }
+            }
+        }
+        storage::save_json(&project_id, "plot.json", &plot)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn generate_names(
+    project_id: String,
+    name_type: String,
+    count: u32,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+    proxy_url: Option<String>,
+) -> Result<Value, String> {
+    // Input validation
+    if count == 0 || count > 50 {
+        return Err("生成数量必须在 1-50 范围内".into());
+    }
+    let allowed_types = ["character", "place", "skill", "item"];
+    if !allowed_types.contains(&name_type.as_str()) {
+        return Err("不支持的名字类型".into());
+    }
+
+    let world = storage::load_json(&project_id, "world.json")?.unwrap_or(json!({}));
+    let world_summary = format!("时代：{}\n概要：{}",
+        world["era"].as_str().unwrap_or(""),
+        truncate_chars(world["overview"].as_str().unwrap_or(""), 800),
+    );
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    engine::generate_names(&client, &world_summary, &name_type, count).await
+}
+
+#[tauri::command]
+async fn deep_sensitivity_check(
+    chapter_text: String,
+    api_format: String,
+    api_key: String,
+    model: String,
+    base_url: String,
+    proxy_url: Option<String>,
+) -> Result<Value, String> {
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    engine::sensitivity_check(&client, &truncate_chars(&chapter_text, 8000)).await
+}
+
+#[tauri::command]
 async fn export_novel(project_id: String, format: String) -> Result<String, String> {
+    use std::io::Write as _;
+
+    log_export_project(&project_id, &format);
+
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let title = meta["title"].as_str().unwrap_or("novel");
 
-    let mut full_text = String::new();
-    full_text.push_str(&format!("\u{300A}{}\u{300B}\n\n", title));
+    // Validate format
+    if format != "txt" && format != "md" && format != "html" {
+        return Err("不支持的导出格式".into());
+    }
 
     let plot = storage::load_json(&project_id, "plot.json")?;
     let mut chapter_nums: Vec<u32> = Vec::new();
@@ -1562,8 +2541,69 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
         }
     }
     if chapter_nums.is_empty() {
-        chapter_nums = (1..=100).collect();
+        // Scan for existing chapter files
+        for num in 1..=999u32 {
+            let file = format!("chapter_{:03}.json", num);
+            if storage::load_json(&project_id, &file).ok().flatten().is_some() {
+                chapter_nums.push(num);
+            } else {
+                break;
+            }
+        }
     }
+
+    // Estimate total size to prevent OOM
+    let mut estimated_size = 0usize;
+    for num in &chapter_nums {
+        let file = format!("chapter_{:03}.json", num);
+        if let Ok(Some(chapter)) = storage::load_json(&project_id, &file) {
+            if let Some(text) = chapter["text"].as_str() {
+                estimated_size += text.len();
+            }
+        }
+    }
+
+    // Limit to 50MB
+    if estimated_size > 50_000_000 {
+        return Err("小说内容过大（超过 50MB），请分段导出".into());
+    }
+
+    // Create export file
+    let export_dir = storage::project_dir(&project_id).join("exports");
+    std::fs::create_dir_all(&export_dir).map_err(|e: std::io::Error| e.to_string())?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    // Sanitize title for use in filename
+    let safe_title: String = title.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect::<String>()
+        .trim()
+        .chars().take(100)
+        .collect();
+    let safe_title = if safe_title.is_empty() { "novel".to_string() } else { safe_title };
+    let filename = format!("{}_{}.{}", safe_title, timestamp, format);
+    let export_path = export_dir.join(&filename);
+
+    let file = std::fs::File::create(&export_path)
+        .map_err(|e| format!("无法创建导出文件: {}", e))?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    let is_md = format == "md";
+    let is_html = format == "html";
+
+    // Write header
+    if is_html {
+        let header = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{t}</title><style>body{{max-width:800px;margin:40px auto;padding:0 20px;font-family:serif;line-height:1.8;color:#333}}h1{{text-align:center;margin-bottom:40px}}h2{{margin-top:40px;border-bottom:1px solid #eee;padding-bottom:8px}}p{{text-indent:2em;margin:0.5em 0}}</style></head><body><h1>{t}</h1>\n",
+            t = html_escape(title)
+        );
+        writer.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    } else if is_md {
+        writer.write_all(format!("# {}\n\n", title).as_bytes()).map_err(|e| e.to_string())?;
+    } else {
+        writer.write_all(format!("\u{300A}{}\u{300B}\n\n", title).as_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    // Write chapters incrementally
     for num in chapter_nums {
         let file = format!("chapter_{:03}.json", num);
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
@@ -1587,32 +2627,50 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
                     })
                     .unwrap_or_default();
 
-                if !ch_title.is_empty() {
-                    full_text.push_str(&format!("\u{7B2C}{}\u{7AE0} {}\n\n", num, ch_title));
+                if is_html {
+                    let heading = if !ch_title.is_empty() {
+                        format!("<h2>\u{7B2C}{}\u{7AE0} {}</h2>\n", num, html_escape(&ch_title))
+                    } else {
+                        format!("<h2>\u{7B2C}{}\u{7AE0}</h2>\n", num)
+                    };
+                    writer.write_all(heading.as_bytes()).map_err(|e| e.to_string())?;
+                    for para in text.split('\n') {
+                        let p = para.trim();
+                        if !p.is_empty() {
+                            let line = format!("<p>{}</p>\n", html_escape(p));
+                            writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else if is_md {
+                    let heading = if !ch_title.is_empty() {
+                        format!("## \u{7B2C}{}\u{7AE0} {}\n\n", num, ch_title)
+                    } else {
+                        format!("## \u{7B2C}{}\u{7AE0}\n\n", num)
+                    };
+                    writer.write_all(heading.as_bytes()).map_err(|e| e.to_string())?;
+                    writer.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+                    writer.write_all(b"\n\n---\n\n").map_err(|e| e.to_string())?;
                 } else {
-                    full_text.push_str(&format!("\u{7B2C}{}\u{7AE0}\n\n", num));
+                    let heading = if !ch_title.is_empty() {
+                        format!("\u{7B2C}{}\u{7AE0} {}\n\n", num, ch_title)
+                    } else {
+                        format!("\u{7B2C}{}\u{7AE0}\n\n", num)
+                    };
+                    writer.write_all(heading.as_bytes()).map_err(|e| e.to_string())?;
+                    writer.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+                    writer.write_all(b"\n\n").map_err(|e| e.to_string())?;
                 }
-                full_text.push_str(text);
-                full_text.push_str("\n\n");
             }
         }
     }
-    if full_text.trim().lines().count() <= 1 {
-        return Err(
-            "\u{6CA1}\u{6709}\u{53EF}\u{5BFC}\u{51FA}\u{7684}\u{7AE0}\u{8282}\u{5185}\u{5BB9}"
-                .into(),
-        );
+
+    // Write footer
+    if is_html {
+        writer.write_all(b"</body></html>").map_err(|e| e.to_string())?;
     }
 
-    let desktop = dirs::desktop_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let filename = match format.as_str() {
-        "txt" => format!("{}.txt", title),
-        _ => format!("{}.txt", title),
-    };
-    let path = desktop.join(&filename);
-    std::fs::write(&path, &full_text).map_err(|e| e.to_string())?;
-
-    Ok(path.to_string_lossy().to_string())
+    writer.flush().map_err(|e| format!("刷新缓冲区失败: {}", e))?;
+    Ok(export_path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1625,7 +2683,13 @@ pub fn run() {
             get_data_dir,
             set_data_dir,
             test_llm,
+            save_llm_config,
+            get_llm_config,
+            save_llm_profiles,
+            get_llm_profiles,
             agent_chat,
+            agent_chat_stream,
+            cancel_agent_chat,
             chat_with_ai,
             extract_framework,
             create_project,
@@ -1664,6 +2728,9 @@ pub fn run() {
             simulate_reader,
             analyze_writing_style,
             get_style_profile,
+            sync_outline_from_chapter,
+            generate_names,
+            deep_sensitivity_check,
             list_skills,
             install_skill_repo,
             update_skill_repo,
@@ -1680,6 +2747,16 @@ pub fn run() {
             stop_mcp_server,
             get_mcp_logs,
         ])
+        .setup(|_app| {
+            // Register cleanup handler for MCP servers on app exit
+            Ok(())
+        })
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                // Cleanup all MCP servers when window closes
+                plugins::mcp::cleanup_all_servers();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

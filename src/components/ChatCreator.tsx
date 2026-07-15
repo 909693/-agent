@@ -39,13 +39,16 @@ export function ChatCreator({ llm, draft, onDraftChange, onProjectCreated, onCan
   const [loading, setLoading] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const draftRef = useRef(draft);
+  draftRef.current = draft; // Always keep ref in sync with latest draft
   const { genre, messages, input, frameworkReady, error } = draft;
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  const updateDraft = (patch: Partial<ChatDraft>) => onDraftChange({ ...draft, ...patch });
+  // Use ref-based updater to avoid stale closures in async callbacks
+  const updateDraft = (patch: Partial<ChatDraft>) => onDraftChange({ ...draftRef.current, ...patch });
 
   const handleGenreSelect = async (g: string) => {
     if (!llm.apiKey) { updateDraft({ error: "请先在系统设置中配置 API Key" }); return; }
@@ -62,7 +65,7 @@ export function ChatCreator({ llm, draft, onDraftChange, onProjectCreated, onCan
   const handleSend = async () => {
     if (!input.trim() || loading || !genre) return;
     const userMsg = input.trim();
-    const newMessages: ChatMessage[] = [...messages, { role: "user", content: userMsg }];
+    const newMessages: ChatMessage[] = [...draftRef.current.messages, { role: "user", content: userMsg }];
     updateDraft({ messages: newMessages, input: "", error: "" });
     setLoading(true);
     try {
@@ -71,7 +74,7 @@ export function ChatCreator({ llm, draft, onDraftChange, onProjectCreated, onCan
       const reply = await api.chatWithAi(apiMessages, genre, llm, payload);
       const isReady = reply.includes("[FRAMEWORK_READY]");
       const cleanReply = reply.replace("[FRAMEWORK_READY]", "").trim();
-      updateDraft({ messages: [...newMessages, { role: "assistant", content: cleanReply }], frameworkReady: isReady || frameworkReady, error: "" });
+      updateDraft({ messages: [...newMessages, { role: "assistant", content: cleanReply }], frameworkReady: isReady || draftRef.current.frameworkReady, error: "" });
     } catch (e: any) { updateDraft({ error: e.toString() }); }
     setLoading(false);
   };

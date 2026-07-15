@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMeta {
     pub id: String,
@@ -15,6 +16,7 @@ pub struct ProjectMeta {
     pub updated_at: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorldSetting {
     pub era: String,
@@ -26,6 +28,7 @@ pub struct WorldSetting {
     pub culture_notes: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeographyLocation {
     pub name: String,
@@ -36,6 +39,7 @@ pub struct GeographyLocation {
     pub connected_to: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldRule {
     pub category: String,
@@ -47,6 +51,7 @@ pub struct WorldRule {
     pub plot_implications: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Faction {
     pub name: String,

@@ -26,3 +26,15 @@ dist-ssr
 # Claude Code
 .claude/settings.local.json
 __pycache__/
+
+# 安全审计文档（含本地路径，不公开）
+SECURITY_AUDIT_*.md
+SECURITY_FIXES*.md
+
+# 本地设计参考 / 截图
+design-system/
+*.png
+截屏*.png
+
+# Rust 构建产物
+src-tauri/target/

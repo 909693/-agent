@@ -21,7 +21,7 @@ export function Sidebar({ currentPage, hasSelectedNovel, onNavigate }: Props) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
-        <h1>RETL</h1>
+        <h1>祈愿</h1>
         <p>AI 小说创作助手</p>
       </div>
       <nav className="sidebar-nav">

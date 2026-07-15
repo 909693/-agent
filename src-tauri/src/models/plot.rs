@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlotPoint {
     pub id: String,
@@ -16,6 +17,7 @@ pub struct PlotPoint {
     pub consequences: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChapterOutline {
     pub number: u32,
@@ -29,6 +31,7 @@ pub struct ChapterOutline {
     pub location: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Act {
     pub number: u32,
@@ -39,6 +42,7 @@ pub struct Act {
     pub chapters: Vec<ChapterOutline>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlotOutline {
     pub acts: Vec<Act>,
@@ -48,6 +52,7 @@ pub struct PlotOutline {
     pub subplots: Vec<serde_json::Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
     pub id: String,
@@ -63,6 +68,7 @@ pub struct TimelineEvent {
     pub chapter_ref: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Timeline {
     pub events: Vec<TimelineEvent>,

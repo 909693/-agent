@@ -1,4 +1,6 @@
+pub mod context;
 pub mod prompts;
+pub mod tools;
 
 use crate::llm::client::LlmClient;
 use serde_json::Value;
@@ -34,10 +36,53 @@ pub async fn generate_plot(
     tone: &str,
     world_summary: &str,
     characters_summary: &str,
+    target_chapters: Option<u32>,
 ) -> Result<Value, String> {
     let system = "你是一位专业的小说情节架构师。请始终以有效的 JSON 格式输出。";
-    let user = prompts::plot_outline(premise, genre, tone, world_summary, characters_summary);
+    let user = prompts::plot_outline(premise, genre, tone, world_summary, characters_summary, target_chapters);
+    // Each chapter outline needs ~600 tokens
+    let chapters = target_chapters.unwrap_or(50);
+    let max_tokens: u32 = ((chapters as u32) * 600).max(16384).min(1000000);
+    client.generate_json(system, &user, max_tokens).await
+}
+
+pub async fn generate_plot_skeleton(
+    client: &LlmClient,
+    premise: &str,
+    genre: &str,
+    tone: &str,
+    world_summary: &str,
+    characters_summary: &str,
+    target_chapters: u32,
+) -> Result<Value, String> {
+    let system = "你是一位专业的小说情节架构师。请始终以有效的 JSON 格式输出。";
+    let user = prompts::plot_skeleton(premise, genre, tone, world_summary, characters_summary, target_chapters);
     client.generate_json(system, &user, 8192).await
+}
+
+pub async fn generate_act_chapters(
+    client: &LlmClient,
+    act_number: u32,
+    act_title: &str,
+    act_theme: &str,
+    act_key_events: &str,
+    act_end_state: &str,
+    chapter_start: u32,
+    chapter_end: u32,
+    story_context: &str,
+    prev_act_summary: &str,
+    next_act_summary: &str,
+    plot_points_json: &str,
+) -> Result<Value, String> {
+    let system = "你是一位专业的小说情节架构师。请始终以有效的 JSON 格式输出。";
+    let user = prompts::act_chapter_details(
+        act_number, act_title, act_theme, act_key_events, act_end_state,
+        chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
+    );
+    let chapter_count = chapter_end - chapter_start + 1;
+    // Each chapter ~530 chars => ~700 tokens. Use 600 multiplier + overhead for JSON structure
+    let max_tokens: u32 = (chapter_count * 600).max(4096).min(16384);
+    client.generate_json(system, &user, max_tokens).await
 }
 
 pub async fn generate_timeline(
@@ -57,9 +102,12 @@ pub async fn expand_chapter(
     target_words: u32,
     context: &str,
 ) -> Result<Value, String> {
-    let system = "你是一位专业的小说作家。你擅长根据大纲和已有内容进行扩写，保持文风一致、情节连贯。直接输出小说正文，不要输出 JSON。";
+    let system = "你是一位专业的小说作家。你擅长根据大纲和已有内容进行扩写，保持文风一致、情节连贯。你必须严格遵循提供的 Skills 规则和提示词要求来创作。直接输出章节正文，不要输出 JSON 或代码块。";
     let user = prompts::chapter_expand(chapter_outline, user_content, target_words, context);
-    client.generate_json(system, &user, 16384).await
+    eprintln!("[expand_chapter] system={}chars, user={}chars", system.len(), user.chars().count());
+    let msgs = vec![("user".to_string(), user)];
+    let text = client.chat(system, &msgs, 32768).await?;
+    Ok(serde_json::json!({"text": text.trim()}))
 }
 
 pub async fn continue_writing(
@@ -69,9 +117,11 @@ pub async fn continue_writing(
     target_words: u32,
     context: &str,
 ) -> Result<Value, String> {
-    let system = "你是一位专业的小说作家。请根据已有文本和指示继续创作，保持文风一致。直接输出续写内容，不要输出 JSON。";
+    let system = "你是一位专业的小说作家。请根据已有文本和指示继续创作，保持文风一致。直接输出续写正文，不要输出 JSON 或代码块。";
     let user = prompts::continue_write(existing_text, instruction, target_words, context);
-    client.generate_json(system, &user, 16384).await
+    let msgs = vec![("user".to_string(), user)];
+    let text = client.chat(system, &msgs, 32768).await?;
+    Ok(serde_json::json!({"text": text.trim()}))
 }
 
 /// Summarize a chapter for RAG context retrieval
@@ -105,7 +155,11 @@ pub async fn summarize_chapter(
   "settings_introduced": ["新出现的设定/地点/物品"],
   "end_state": "章节结尾时的场景状态，50字以内"
 }}"#,
-        &chapter_text[..chapter_text.len().min(3000)]
+        // Truncate to ~3000 characters safely
+        {
+            let truncated: String = chapter_text.chars().take(3000).collect();
+            truncated
+        }
     );
     client.generate_json(system, &user, 2048).await
 }
@@ -141,5 +195,38 @@ pub async fn analyze_style(
 ) -> Result<Value, String> {
     let system = "你是文学评论家和文体学专家，擅长从文本中提取精确的风格特征。请以 JSON 格式输出。";
     let user = prompts::analyze_style(samples);
+    client.generate_json(system, &user, 4096).await
+}
+
+/// Sync outline summary from chapter content
+pub async fn sync_outline(
+    client: &LlmClient,
+    chapter_text: &str,
+    chapter_number: u32,
+) -> Result<Value, String> {
+    let system = "你是小说编辑助手。请根据章节正文生成精确的章节摘要。以 JSON 格式输出。";
+    let user = prompts::sync_outline(chapter_text, chapter_number);
+    client.generate_json(system, &user, 2048).await
+}
+
+/// Generate names based on world setting
+pub async fn generate_names(
+    client: &LlmClient,
+    world_summary: &str,
+    name_type: &str,
+    count: u32,
+) -> Result<Value, String> {
+    let system = "你是擅长命名的小说创作助手。请根据世界观设定生成符合氛围的名字。以 JSON 格式输出。";
+    let user = prompts::name_generator(world_summary, name_type, count);
+    client.generate_json(system, &user, 2048).await
+}
+
+/// Deep sensitivity check using AI
+pub async fn sensitivity_check(
+    client: &LlmClient,
+    chapter_text: &str,
+) -> Result<Value, String> {
+    let system = "你是网文平台内容审核专家，熟悉各大平台的审核标准。请以 JSON 格式输出。";
+    let user = prompts::sensitivity_check(chapter_text);
     client.generate_json(system, &user, 4096).await
 }

@@ -1,6 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, type ProjectMeta, type LlmParams, type BatchProgress, type BatchComplete } from "../api";
+
+const BATCH_CHUNK_SIZE = 100;
+import { api, type ProjectMeta, type LlmParams, type BatchProgress, type BatchComplete, type PlotProgress } from "../api";
 import { ExportDialog } from "./ExportDialog";
 import { CreativeConstraintsPanel } from "./CreativeConstraintsPanel";
 import { buildCreativeConstraintsPayload } from "../utils/buildCreativeConstraints";
@@ -35,6 +37,8 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [showExport, setShowExport] = useState(false);
   const [outlineText, setOutlineText] = useState("");
   const [outlineName, setOutlineName] = useState("");
+  const [targetChapters, setTargetChapters] = useState<number | undefined>(50);
+  const [plotProgress, setPlotProgress] = useState<PlotProgress | null>(null);
 
   // Batch generation state
   const [batchRunning, setBatchRunning] = useState(false);
@@ -44,6 +48,17 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [batchResult, setBatchResult] = useState<BatchComplete | null>(null);
   const [chapterStatuses, setChapterStatuses] = useState<Record<number, string>>({});
+
+  // Chunked batch scheduling (single task can only cover 100 chapters; split into chunks)
+  const [chunkInfo, setChunkInfo] = useState<{ current: number; total: number } | null>(null);
+  const cancelRef = useRef(false);
+  const aggregateRef = useRef<BatchComplete>({
+    completed: 0, failed: 0, skipped: 0, total_words: 0, elapsed_seconds: 0, failed_chapters: [],
+  });
+
+  // Summarize state
+  const [summarizingChapters, setSummarizingChapters] = useState<Set<number>>(new Set());
+  const [summarizingAll, setSummarizingAll] = useState(false);
 
   // Tracking state
   const [summaries, setSummaries] = useState<any>(null);
@@ -56,6 +71,10 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [nameType, setNameType] = useState("character");
+  const [nameCount, setNameCount] = useState(10);
+  const [generatedNames, setGeneratedNames] = useState<any[] | null>(null);
+  const [generatingNames, setGeneratingNames] = useState(false);
 
   useEffect(() => {
     api.getWorld(project.id).then(setWorld).catch(() => setWorld(null));
@@ -72,23 +91,40 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     }).catch(() => { setOutlineText(""); setOutlineName(""); });
   }, [project.id]);
 
-  // Batch event listeners
+  // Batch event listeners — progress updates UI; completion is consumed by the chunk scheduler via a one-shot resolver.
+  const chunkResolverRef = useRef<((c: BatchComplete) => void) | null>(null);
   useEffect(() => {
-    let unProgress: UnlistenFn | undefined;
-    let unComplete: UnlistenFn | undefined;
+    let cancelled = false;
+    const unlisteners: UnlistenFn[] = [];
+
     (async () => {
-      unProgress = await listen<BatchProgress>("batch_progress", (e) => {
+      const u1 = await listen<BatchProgress>("batch_progress", (e) => {
         setBatchProgress(e.payload);
         setChapterStatuses(prev => ({ ...prev, [e.payload.chapter_number]: e.payload.phase }));
       });
-      unComplete = await listen<BatchComplete>("batch_complete", (e) => {
-        setBatchResult(e.payload);
-        setBatchRunning(false);
-        if (plot) loadChapterTexts(plot);
+      if (cancelled) { u1(); return; }
+      unlisteners.push(u1);
+
+      const u2 = await listen<BatchComplete>("batch_complete", (e) => {
+        const resolver = chunkResolverRef.current;
+        chunkResolverRef.current = null;
+        if (resolver) resolver(e.payload);
       });
-    })();
-    return () => { unProgress?.(); unComplete?.(); };
-  }, [plot]);
+      if (cancelled) { u2(); return; }
+      unlisteners.push(u2);
+
+      const u3 = await listen<PlotProgress>("plot_progress", (e) => {
+        setPlotProgress(e.payload);
+      });
+      if (cancelled) { u3(); return; }
+      unlisteners.push(u3);
+    })().catch(() => {});
+
+    return () => {
+      cancelled = true;
+      unlisteners.forEach(fn => fn());
+    };
+  }, []);
 
   // Set default batch range when chapters load
   useEffect(() => {
@@ -105,13 +141,21 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   }, [plot, chapterTexts]);
   const loadChapterTexts = async (plotData: any) => {
     if (!plotData?.acts) return;
-    const texts: Record<number, string> = {};
+    const allChapterNums: number[] = [];
     for (const act of plotData.acts) {
-      for (const ch of act.chapters || []) {
-        try {
-          const d: any = await api.getChapter(project.id, ch.number);
-          if (d.text) texts[ch.number] = d.text;
-        } catch { /* no chapter yet */ }
+      for (const ch of act.chapters || []) allChapterNums.push(ch.number);
+    }
+    // Load chapters in parallel instead of serial waterfall
+    const results = await Promise.allSettled(
+      allChapterNums.map(async (num) => {
+        const d: any = await api.getChapter(project.id, num);
+        return { num, text: d.text || "" };
+      })
+    );
+    const texts: Record<number, string> = {};
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value.text) {
+        texts[r.value.num] = r.value.text;
       }
     }
     setChapterTexts(texts);
@@ -166,7 +210,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setWorld(await api.generateWorld(project.id, llm, payload));
     }
     catch (e: any) { setError(e.toString()); }
-    setLoading("");
+    finally { setLoading(""); }
   };
 
   const handleGenCharacters = async () => {
@@ -177,98 +221,158 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setCharacters(await api.generateCharacters(project.id, llm, payload));
     }
     catch (e: any) { setError(e.toString()); }
-    setLoading("");
+    finally { setLoading(""); }
   };
 
   const handleGenPlot = async () => {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
-    setLoading("plot"); setError("");
+    setLoading("plot"); setError(""); setPlotProgress(null);
     try {
       const payload = await buildCreativeConstraintsPayload();
-      const p = await api.generatePlot(project.id, llm, payload);
+      const p = await api.generatePlot(project.id, llm, payload, targetChapters);
       setPlot(p);
       loadChapterTexts(p);
     } catch (e: any) { setError(e.toString()); }
-    setLoading("");
+    finally { setLoading(""); setPlotProgress(null); }
   };
   const handleGenerateAll = async () => {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
-    const payload = await buildCreativeConstraintsPayload();
-    setError("");
-    setLoading("world");
-    try { setWorld(await api.generateWorld(project.id, llm, payload)); } catch (e: any) { setError(e.toString()); setLoading(""); return; }
-    setLoading("characters");
-    try { setCharacters(await api.generateCharacters(project.id, llm, payload)); } catch (e: any) { setError(e.toString()); setLoading(""); return; }
-    setLoading("plot");
     try {
-      const p = await api.generatePlot(project.id, llm, payload);
+      const payload = await buildCreativeConstraintsPayload();
+      setError("");
+      setLoading("world");
+      setWorld(await api.generateWorld(project.id, llm, payload));
+      setLoading("characters");
+      setCharacters(await api.generateCharacters(project.id, llm, payload));
+      setLoading("plot"); setPlotProgress(null);
+      const p = await api.generatePlot(project.id, llm, payload, targetChapters);
       setPlot(p);
       loadChapterTexts(p);
     } catch (e: any) { setError(e.toString()); }
-    setLoading("");
+    finally { setLoading(""); setPlotProgress(null); }
   };
 
   const handleBatchGenerate = async () => {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
     if (batchStart > batchEnd) { setError("起始章号不能大于结束章号"); return; }
-    setError(""); setBatchResult(null); setChapterStatuses({});
+    setError("");
+    setBatchResult(null);
+    setChapterStatuses({});
+    aggregateRef.current = {
+      completed: 0, failed: 0, skipped: 0, total_words: 0, elapsed_seconds: 0, failed_chapters: [],
+    };
+    cancelRef.current = false;
     setBatchRunning(true);
+
+    const chunks: Array<{ from: number; to: number }> = [];
+    for (let from = batchStart; from <= batchEnd; from += BATCH_CHUNK_SIZE) {
+      chunks.push({ from, to: Math.min(from + BATCH_CHUNK_SIZE - 1, batchEnd) });
+    }
+    setChunkInfo({ current: 0, total: chunks.length });
+
     try {
       const payload = await buildCreativeConstraintsPayload();
-      await api.batchGenerateChapters(
-        project.id, batchStart, batchEnd,
-        project.target_chapter_words || 3000, skipWritten, llm, payload,
-      );
-    } catch (e: any) { setError(e.toString()); setBatchRunning(false); }
+      for (let i = 0; i < chunks.length; i++) {
+        if (cancelRef.current) break;
+        const { from, to } = chunks[i];
+        setChunkInfo({ current: i + 1, total: chunks.length });
+
+        const done = new Promise<BatchComplete>((resolve, reject) => {
+          chunkResolverRef.current = resolve;
+          setTimeout(() => reject(new Error("batch_complete 事件超时")), 600_000);
+        });
+
+        try {
+          await api.batchGenerateChapters(
+            project.id, from, to,
+            project.target_chapter_words || 3000, skipWritten, llm, payload,
+          );
+        } catch (e: any) {
+          chunkResolverRef.current = null;
+          setError(`第 ${i + 1}/${chunks.length} 批启动失败：${e}`);
+          break;
+        }
+
+        let chunkResult: BatchComplete;
+        try {
+          chunkResult = await done;
+        } catch (e: any) {
+          chunkResolverRef.current = null;
+          setError(e.message || "批量生成超时");
+          break;
+        }
+        const agg = aggregateRef.current;
+        agg.completed += chunkResult.completed;
+        agg.failed += chunkResult.failed;
+        agg.skipped += chunkResult.skipped;
+        agg.total_words += chunkResult.total_words;
+        agg.elapsed_seconds += chunkResult.elapsed_seconds;
+        agg.failed_chapters = agg.failed_chapters.concat(chunkResult.failed_chapters);
+
+        // If this chunk was cancelled mid-way, stop scheduling more chunks.
+        if (batchProgress?.phase === "cancelled" || cancelRef.current) break;
+      }
+    } finally {
+      setBatchResult({ ...aggregateRef.current });
+      setBatchRunning(false);
+      setChunkInfo(null);
+      chunkResolverRef.current = null;
+      if (plot) loadChapterTexts(plot);
+    }
   };
 
   const handleCancelBatch = async () => {
+    cancelRef.current = true;
     try { await api.cancelBatchGeneration(); } catch (e: any) { setError(e.toString()); }
   };
 
   // === Tracking data processing ===
-  const characterTimeline: Record<string, Array<{ chapter: number; change: string }>> = {};
-  const foreshadowingItems: Array<{ content: string; plantedChapter: number; resolvedChapter: number | null; status: "active" | "resolved" }> = [];
+  const { characterTimeline, foreshadowingItems } = useMemo(() => {
+    const timeline: Record<string, Array<{ chapter: number; change: string }>> = {};
+    const items: Array<{ content: string; plantedChapter: number; resolvedChapter: number | null; status: "active" | "resolved" }> = [];
 
-  if (summaries && typeof summaries === "object") {
-    const sortedKeys = Object.keys(summaries).sort((a, b) => Number(a) - Number(b));
-    const allResolved: Array<{ text: string; chapter: number }> = [];
+    if (summaries && typeof summaries === "object") {
+      const sortedKeys = Object.keys(summaries).sort((a, b) => Number(a) - Number(b));
+      const allResolved: Array<{ text: string; chapter: number }> = [];
 
-    for (const key of sortedKeys) {
-      const ch = Number(key);
-      const s = summaries[key];
-      // Character timeline
-      if (Array.isArray(s.character_changes)) {
-        for (const c of s.character_changes) {
-          const name = c.name || "";
-          if (name) {
-            if (!characterTimeline[name]) characterTimeline[name] = [];
-            characterTimeline[name].push({ chapter: ch, change: c.change || "" });
+      for (const key of sortedKeys) {
+        const ch = Number(key);
+        const s = summaries[key];
+        // Character timeline
+        if (Array.isArray(s.character_changes)) {
+          for (const c of s.character_changes) {
+            const name = c.name || "";
+            if (name) {
+              if (!timeline[name]) timeline[name] = [];
+              timeline[name].push({ chapter: ch, change: c.change || "" });
+            }
+          }
+        }
+        // Foreshadowing planted
+        if (Array.isArray(s.foreshadowing_planted)) {
+          for (const f of s.foreshadowing_planted) {
+            if (f) items.push({ content: f, plantedChapter: ch, resolvedChapter: null, status: "active" });
+          }
+        }
+        // Foreshadowing resolved
+        if (Array.isArray(s.foreshadowing_resolved)) {
+          for (const f of s.foreshadowing_resolved) {
+            if (f) allResolved.push({ text: f, chapter: ch });
           }
         }
       }
-      // Foreshadowing planted
-      if (Array.isArray(s.foreshadowing_planted)) {
-        for (const f of s.foreshadowing_planted) {
-          if (f) foreshadowingItems.push({ content: f, plantedChapter: ch, resolvedChapter: null, status: "active" });
-        }
-      }
-      // Foreshadowing resolved
-      if (Array.isArray(s.foreshadowing_resolved)) {
-        for (const f of s.foreshadowing_resolved) {
-          if (f) allResolved.push({ text: f, chapter: ch });
-        }
+      // Cross-reference: mark resolved
+      for (const r of allResolved) {
+        const match = items.find(fi => fi.status === "active" && fi.content.includes(r.text));
+        if (match) { match.status = "resolved"; match.resolvedChapter = r.chapter; }
       }
     }
-    // Cross-reference: mark resolved
-    for (const r of allResolved) {
-      const match = foreshadowingItems.find(fi => fi.status === "active" && fi.content.includes(r.text));
-      if (match) { match.status = "resolved"; match.resolvedChapter = r.chapter; }
-    }
-  }
 
-  const activeForeshadowing = foreshadowingItems.filter(f => f.status === "active");
-  const resolvedForeshadowing = foreshadowingItems.filter(f => f.status === "resolved");
+    return { characterTimeline: timeline, foreshadowingItems: items };
+  }, [summaries]);
+
+  const activeForeshadowing = useMemo(() => foreshadowingItems.filter(f => f.status === "active"), [foreshadowingItems]);
+  const resolvedForeshadowing = useMemo(() => foreshadowingItems.filter(f => f.status === "resolved"), [foreshadowingItems]);
 
   const handleCheckConsistency = async () => {
     if (!llm.apiKey) { setError("请先配置 API Key"); return; }
@@ -298,6 +402,71 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setStyleProfile(result);
     } catch (e: any) { setError(e.toString()); }
     setAnalyzingStyle(false);
+  };
+
+  const handleGenerateNames = async () => {
+    if (!llm.apiKey) { setError("请先配置 API Key"); return; }
+    setGeneratingNames(true); setError(""); setGeneratedNames(null);
+    try {
+      const result = await api.generateNames(project.id, nameType, nameCount, llm);
+      setGeneratedNames(Array.isArray(result.names) ? result.names : []);
+    } catch (e: any) { setError(e.toString()); }
+    setGeneratingNames(false);
+  };
+
+  const handleMoveChapter = async (chIdx: number, direction: "up" | "down") => {
+    if (!plot?.acts) return;
+    // Deep clone to avoid mutating React state
+    const newPlot = JSON.parse(JSON.stringify(plot));
+    const flat: Array<{actIdx: number; chIdx: number; ch: any}> = [];
+    newPlot.acts.forEach((act: any, ai: number) => {
+      (act.chapters || []).forEach((ch: any, ci: number) => {
+        flat.push({ actIdx: ai, chIdx: ci, ch });
+      });
+    });
+    const globalIdx = flat.findIndex(f => f.ch.number === allChapters[chIdx]?.number);
+    const swapIdx = direction === "up" ? globalIdx - 1 : globalIdx + 1;
+    if (swapIdx < 0 || swapIdx >= flat.length) return;
+    // Swap chapter numbers
+    const tmpNum = flat[globalIdx].ch.number;
+    flat[globalIdx].ch.number = flat[swapIdx].ch.number;
+    flat[swapIdx].ch.number = tmpNum;
+    // Save
+    try {
+      await api.savePlotOutline(project.id, newPlot);
+      setPlot(newPlot);
+    } catch (e: any) { setError(e.toString()); }
+  };
+
+  const handleSummarizeChapter = async (chapterNumber: number) => {
+    setSummarizingChapters(prev => new Set(prev).add(chapterNumber));
+    try {
+      await api.summarizeChapter(project.id, chapterNumber, llm);
+      const s = await api.getChapterSummaries(project.id);
+      setSummaries(s);
+    } catch (e: any) {
+      setError(`摘要生成失败（第${chapterNumber}章）：${e}`);
+    } finally {
+      setSummarizingChapters(prev => { const n = new Set(prev); n.delete(chapterNumber); return n; });
+    }
+  };
+
+  const handleSummarizeAll = async () => {
+    const chaptersToSummarize = allChapters.filter(ch => {
+      const written = (chapterTexts[ch.number] || "").length > 0;
+      const hasSummary = summaries?.[String(ch.number)];
+      return written && !hasSummary;
+    });
+    if (chaptersToSummarize.length === 0) return;
+    setSummarizingAll(true);
+    try {
+      for (const ch of chaptersToSummarize) {
+        if (cancelRef.current) break;
+        await handleSummarizeChapter(ch.number);
+      }
+    } finally {
+      setSummarizingAll(false);
+    }
   };
 
   const allChapters: { number: number; title: string; summary: string }[] = [];
@@ -430,6 +599,36 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
               )}
             </>
           )}
+          {/* Name Generator */}
+          <div className="content-section" style={{ marginTop: 16 }}>
+            <h3>自动起名器</h3>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+              <select value={nameType} onChange={e => setNameType(e.target.value)}>
+                <option value="character">人名</option>
+                <option value="place">地名</option>
+                <option value="skill">功法/技能名</option>
+                <option value="item">物品/道具名</option>
+              </select>
+              <select value={nameCount} onChange={e => setNameCount(Number(e.target.value))}>
+                <option value={5}>5 个</option>
+                <option value={10}>10 个</option>
+                <option value={20}>20 个</option>
+              </select>
+              <button className="btn-primary" onClick={handleGenerateNames} disabled={generatingNames}>
+                {generatingNames ? <><span className="loading-spinner" />生成中</> : "生成"}
+              </button>
+            </div>
+            {generatedNames && (
+              <div className="card-grid">
+                {generatedNames.map((n: any, i: number) => (
+                  <div key={i} className="info-card" style={{ cursor: "pointer" }} onClick={() => navigator.clipboard.writeText(n.name)}>
+                    <h4>{n.name}</h4>
+                    <p className="dim" style={{ fontSize: 12 }}>{n.origin}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
       {tab === "characters" && (
@@ -496,10 +695,27 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       {tab === "plot" && (
         <div>
           <div className="generate-bar">
+            <input
+              type="number"
+              placeholder="目标章节数（可选）"
+              value={targetChapters ?? ""}
+              onChange={(e) => setTargetChapters(e.target.value ? parseInt(e.target.value) : undefined)}
+              min="1"
+              max="500"
+              style={{ marginRight: 8, width: 150 }}
+            />
             <button className="btn-primary" onClick={handleGenPlot} disabled={!!loading}>
               {loading === "plot" ? <><span className="loading-spinner" />生成中...</> : plot ? "重新生成" : "生成情节"}
             </button>
           </div>
+          {loading === "plot" && plotProgress && (
+            <div className="dim" style={{ fontSize: 13, padding: "8px 0" }}>
+              {plotProgress.message}
+              {plotProgress.phase === "act_details" && plotProgress.total_acts > 0 && (
+                <span style={{ marginLeft: 8 }}>（{plotProgress.current_act}/{plotProgress.total_acts}）</span>
+              )}
+            </div>
+          )}
           {plot?.acts && plot.acts.map((act: any, i: number) => (
             <div key={i} className="act-section">
               <h3>第{act.number}幕：{act.title}</h3>
@@ -590,7 +806,13 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                   </label>
                   {!batchRunning ? (
                     <button className="btn-primary" onClick={handleBatchGenerate} disabled={!!loading}>
-                      开始批量生成（{batchEnd - batchStart + 1} 章）
+                      {(() => {
+                        const total = batchEnd - batchStart + 1;
+                        const chunks = Math.ceil(total / BATCH_CHUNK_SIZE);
+                        return chunks > 1
+                          ? `开始批量生成（${total} 章 · 分 ${chunks} 批）`
+                          : `开始批量生成（${total} 章）`;
+                      })()}
                     </button>
                   ) : (
                     <button className="btn-danger" onClick={handleCancelBatch}>取消生成</button>
@@ -604,6 +826,9 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                       <div className="batch-progress-fill" style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }} />
                     </div>
                     <div className="batch-progress-info">
+                      {chunkInfo && chunkInfo.total > 1 && (
+                        <span className="dim">批次 {chunkInfo.current}/{chunkInfo.total}</span>
+                      )}
                       <span>第 {batchProgress.chapter_number} 章</span>
                       <span className={`phase-badge phase-${batchProgress.phase}`}>
                         {batchProgress.phase === "context" && "构建上下文..."}
@@ -630,6 +855,13 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                 )}
               </div>
 
+              <div className="generate-bar" style={{ marginBottom: 12 }}>
+                <button className="btn-primary" onClick={handleSummarizeAll} disabled={summarizingAll || !llm.apiKey}>
+                  {summarizingAll ? <><span className="loading-spinner" />批量摘要中...</> : "全部生成摘要"}
+                </button>
+                {summaries && <span className="dim" style={{ marginLeft: 8 }}>已有 {Object.keys(summaries).length} 章摘要</span>}
+              </div>
+
               <table className="chapter-table">
               <thead>
                 <tr>
@@ -641,7 +873,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {allChapters.map(ch => {
+                {allChapters.map((ch, idx) => {
                   const text = chapterTexts[ch.number] || "";
                   const wc = text.length;
                   const written = wc > 0;
@@ -671,6 +903,18 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                         <button className="btn-sm" onClick={() => onWriteChapter(ch.number)}>
                           {written ? "编辑" : "写作"}
                         </button>
+                        {written && (
+                          <button
+                            className={`btn-sm${summaries?.[String(ch.number)] ? " btn-done" : ""}`}
+                            onClick={() => handleSummarizeChapter(ch.number)}
+                            disabled={summarizingChapters.has(ch.number) || !llm.apiKey}
+                            title={summaries?.[String(ch.number)] ? "重新生成摘要" : "生成摘要"}
+                          >
+                            {summarizingChapters.has(ch.number) ? <span className="loading-spinner" /> : summaries?.[String(ch.number)] ? "✓ 摘要" : "摘要"}
+                          </button>
+                        )}
+                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "up")} disabled={idx === 0} title="上移">↑</button>
+                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "down")} disabled={idx === allChapters.length - 1} title="下移">↓</button>
                       </td>
                     </tr>
                   );

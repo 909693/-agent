@@ -136,18 +136,45 @@ pub fn get_skill_detail(skill_id: String) -> Result<Value, String> {
 }
 
 pub fn read_skill_file(skill_id: String, relative_path: String) -> Result<String, String> {
+    // Validate relative_path to prevent path traversal
+    if relative_path.contains("..") || relative_path.starts_with('/') || relative_path.starts_with('\\') || relative_path.contains('\0') {
+        return Err("Invalid relative path".into());
+    }
+    // Block Windows absolute paths (e.g. C:\, \\server\share)
+    if relative_path.len() >= 2 && relative_path.as_bytes()[1] == b':' {
+        return Err("Invalid relative path".into());
+    }
+
     let records = load_registry()?;
     let record = records
         .iter()
         .find(|item| item.id == skill_id)
         .cloned()
         .ok_or_else(|| "Skill not found".to_string())?;
+
     let root = PathBuf::from(&record.install_path);
     let full = root.join(&relative_path);
+
+    // Verify path is within skill directory BEFORE canonicalize
+    // to prevent TOCTOU race condition
+    if !full.starts_with(&root) {
+        return Err("Path traversal attempt".into());
+    }
+
+    // Additional check after canonicalize
     let canon_root = root.canonicalize().map_err(|e| e.to_string())?;
     let canon_file = full.canonicalize().map_err(|e| e.to_string())?;
+
     if !canon_file.starts_with(&canon_root) {
         return Err("Invalid file path".into());
     }
-    fs::read_to_string(canon_file).map_err(|e| e.to_string())
+
+    // Limit file size to prevent DoS
+    let metadata = fs::metadata(&canon_file).map_err(|e| e.to_string())?;
+    if metadata.len() > 10_000_000 {
+        // 10MB limit
+        return Err("File too large (max 10MB)".into());
+    }
+
+    fs::read_to_string(&canon_file).map_err(|e| e.to_string())
 }

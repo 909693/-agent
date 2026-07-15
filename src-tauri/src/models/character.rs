@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Character {
     pub id: String,
@@ -45,6 +46,7 @@ pub struct Relationship {
     pub evolution: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CharacterEnsemble {
     pub characters: Vec<Character>,

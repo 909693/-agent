@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { api, type LlmParams } from "../api";
 import { logWords } from "../utils/writingLog";
 import { CreativeConstraintsPanel } from "./CreativeConstraintsPanel";
 import { buildCreativeConstraintsPayload } from "../utils/buildCreativeConstraints";
+import { checkSensitiveWords, type SensitiveMatch } from "../utils/sensitiveWords";
 
 interface Props {
   projectId: string;
@@ -38,8 +39,10 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [targetWords, setTargetWords] = useState(3000);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [mode, setMode] = useState<"fill" | "partial" | "expand" | "continue" | "review" | "reader">("fill");
+  const [mode, setMode] = useState<"fill" | "partial" | "expand" | "continue" | "review" | "reader" | "sensitive">("fill");
   const [readerResult, setReaderResult] = useState<any>(null);
+  const [sensitiveLocal, setSensitiveLocal] = useState<SensitiveMatch[] | null>(null);
+  const [sensitiveAi, setSensitiveAi] = useState<any>(null);
   const [chapters, setChapters] = useState<ChapterInfo[]>([]);
   const [characters, setCharacters] = useState<CharacterInfo[]>([]);
   const [selectedCharacterId, setSelectedCharacterId] = useState("");
@@ -53,8 +56,12 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [partialHint, setPartialHint] = useState("");
   const [partialDelta, setPartialDelta] = useState(300);
   const [partialPreview, setPartialPreview] = useState("");
+  const [autoSaveStatus, setAutoSaveStatus] = useState<"" | "saving" | "saved">("");
   const prevWordCount = useRef(0);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const loadedTextRef = useRef("");
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevChapterRef = useRef({ projectId, chapterNum, text: "" });
   const [chapterContext, setChapterContext] = useState<any>(null);
   const [showStates, setShowStates] = useState(false);
   const [showForeshadowing, setShowForeshadowing] = useState(false);
@@ -80,13 +87,39 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
 
   useEffect(() => {
     setSaved(false);
+    // Flush pending auto-save for the PREVIOUS chapter before switching
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    // Save previous chapter's unsaved changes (using refs which hold previous values)
+    if (loadedTextRef.current !== "" && prevChapterRef.current.text !== loadedTextRef.current) {
+      // text was modified but not yet saved — flush it
+      const prev = prevChapterRef.current;
+      if (prev.text && prev.text !== loadedTextRef.current) {
+        api.saveChapter(prev.projectId, prev.chapterNum, prev.text).catch(() => {});
+      }
+    }
+    // Reset all AI results when switching chapters
+    setError("");
+    setReviewResult("");
+    setReaderResult(null);
+    setSensitiveLocal(null);
+    setSensitiveAi(null);
+    setPartialPreview("");
+    setSelectionText("");
+    setSelectionStart(0);
+    setSelectionEnd(0);
+    setAutoSaveStatus("");
     api.getChapter(projectId, chapterNum)
       .then((d: any) => {
         const t = d.text || "";
         setText(t);
+        loadedTextRef.current = t;
         prevWordCount.current = t.length;
+        prevChapterRef.current = { projectId, chapterNum, text: t };
       })
-      .catch(() => { setText(""); prevWordCount.current = 0; });
+      .catch(() => { setText(""); loadedTextRef.current = ""; prevWordCount.current = 0; prevChapterRef.current = { projectId, chapterNum, text: "" }; });
   }, [projectId, chapterNum]);
 
   useEffect(() => {
@@ -95,14 +128,50 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       .catch(() => setChapterContext(null));
   }, [projectId, chapterNum]);
 
+  // Debounced auto-save: 3 seconds after user stops typing
+  useEffect(() => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    // Don't auto-save if text is empty or unchanged from loaded version
+    if (!text || text === loadedTextRef.current) return;
+
+    autoSaveTimerRef.current = setTimeout(async () => {
+      setAutoSaveStatus("saving");
+      try {
+        await api.saveChapter(projectId, chapterNum, text);
+        const delta = text.length - prevWordCount.current;
+        if (delta > 0) logWords(delta);
+        prevWordCount.current = text.length;
+        loadedTextRef.current = text;
+        setAutoSaveStatus("saved");
+        setSaved(true);
+        // Clear "已自动保存" indicator after 2 seconds
+        setTimeout(() => setAutoSaveStatus(""), 2000);
+      } catch {
+        setAutoSaveStatus("");
+      }
+    }, 3000);
+
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+    };
+  }, [text, projectId, chapterNum]);
+
   const currentChapter = chapters.find(c => c.number === chapterNum);
-  const relevantCharacters = characters.filter((c) => {
-    const chapterText = `${currentChapter?.summary || ""} ${currentChapter?.title || ""}`;
-    const byName = c.name && chapterText.includes(c.name);
-    const byPov = currentChapter?.povCharacter && (currentChapter.povCharacter === c.name || currentChapter.povCharacter === c.id);
-    return byName || byPov;
-  });
-  const displayedCharacters = relevantCharacters.length > 0 ? relevantCharacters : characters.slice(0, 6);
+  const displayedCharacters = useMemo(() => {
+    const relevant = characters.filter((c) => {
+      const chapterText = `${currentChapter?.summary || ""} ${currentChapter?.title || ""}`;
+      const byName = c.name && chapterText.includes(c.name);
+      const byPov = currentChapter?.povCharacter && (currentChapter.povCharacter === c.name || currentChapter.povCharacter === c.id);
+      return byName || byPov;
+    });
+    return relevant.length > 0 ? relevant : characters.slice(0, 6);
+  }, [characters, currentChapter]);
   const selectedCharacter = displayedCharacters.find((c) => c.id === selectedCharacterId) || displayedCharacters[0] || null;
   const chapterNotes = selectedCharacter ? [
     currentChapter?.povCharacter && (currentChapter.povCharacter === selectedCharacter.id || currentChapter.povCharacter === selectedCharacter.name)
@@ -122,7 +191,6 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const handleFillToTarget = async () => {
     if (!llm.apiKey) { setError("请先配置 API Key"); return; }
     if (!currentChapter) { setError("缺少章节大纲"); return; }
-    if (!text.trim() && !fillHint.trim()) { setError("请至少提供现有正文或补充说明"); return; }
     setLoading(true); setError("");
     try {
       const payload = await buildCreativeConstraintsPayload();
@@ -132,7 +200,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       setText(result.text || JSON.stringify(result));
       setSaved(false);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
   };
 
   const handleExpand = async () => {
@@ -144,7 +212,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       setText(result.text || JSON.stringify(result));
       setSaved(false);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
   };
 
   const handleContinue = async () => {
@@ -156,7 +224,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       setText(result.text || JSON.stringify(result));
       setSaved(false);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
   };
 
   const handleReview = async () => {
@@ -168,7 +236,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       const result = await api.reviewChapter(projectId, chapterNum, text, platform, llm, payload);
       setReviewResult(result);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
   };
 
   const handleReaderSim = async () => {
@@ -179,7 +247,31 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       const result = await api.simulateReader(projectId, chapterNum, text, llm);
       setReaderResult(result);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
+  };
+
+  const handleSyncOutline = async () => {
+    if (!llm.apiKey || !text.trim()) return;
+    setLoading(true); setError("");
+    try {
+      await api.syncOutlineFromChapter(projectId, chapterNum, llm);
+      setError(""); alert("大纲已同步更新！");
+    } catch (e: any) { setError(e.toString()); }
+    finally { setLoading(false); }
+  };
+
+  const handleLocalSensitivity = () => {
+    setSensitiveLocal(checkSensitiveWords(text));
+  };
+
+  const handleAiSensitivity = async () => {
+    if (!llm.apiKey || !text.trim()) return;
+    setLoading(true); setError(""); setSensitiveAi(null);
+    try {
+      const result = await api.deepSensitivityCheck(text, llm);
+      setSensitiveAi(result);
+    } catch (e: any) { setError(e.toString()); }
+    finally { setLoading(false); }
   };
 
   const handleSelectionChange = () => {
@@ -203,12 +295,15 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       setPartialPreview(replacement);
       setSaved(false);
     } catch (e: any) { setError(e.toString()); }
-    setLoading(false);
+    finally { setLoading(false); }
   };
 
   const applyPartialRewrite = () => {
     if (!partialPreview) return;
-    const newText = text.slice(0, selectionStart) + partialPreview + text.slice(selectionEnd);
+    // Re-validate selection positions against current text
+    const safeStart = Math.min(selectionStart, text.length);
+    const safeEnd = Math.min(selectionEnd, text.length);
+    const newText = text.slice(0, safeStart) + partialPreview + text.slice(safeEnd);
     setText(newText);
     setSelectionText(partialPreview);
     setPartialPreview("");
@@ -217,11 +312,18 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
 
   const handleSave = async () => {
     try {
+      // Cancel any pending auto-save
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
       await api.saveChapter(projectId, chapterNum, text);
       const delta = text.length - prevWordCount.current;
       if (delta > 0) logWords(delta);
       prevWordCount.current = text.length;
+      loadedTextRef.current = text;
       setSaved(true);
+      setAutoSaveStatus("");
       setError("");
     } catch (e: any) { setError(e.toString()); }
   };
@@ -239,6 +341,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     try {
       const result: any = await api.restoreSnapshot(projectId, chapterNum, file);
       setText(result.text || "");
+      loadedTextRef.current = result.text || "";
       prevWordCount.current = (result.text || "").length;
       setSaved(true);
       setShowSnapshots(false);
@@ -277,6 +380,8 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           <button onClick={goNext}>→</button>
           <span className="word-count">{wordCount} 字</span>
           {saved && <span className="saved-tag">✓ 已保存</span>}
+          {autoSaveStatus === "saving" && <span className="saved-tag" style={{ color: "#f59e0b" }}>自动保存中...</span>}
+          {autoSaveStatus === "saved" && <span className="saved-tag" style={{ color: "#22c55e" }}>已自动保存</span>}
         </div>
       </div>
 
@@ -295,7 +400,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
             ref={textAreaRef}
             className="chapter-text"
             value={text}
-            onChange={e => { setText(e.target.value); setSaved(false); }}
+            onChange={e => { setText(e.target.value); setSaved(false); prevChapterRef.current.text = e.target.value; }}
             onSelect={handleSelectionChange}
             onKeyUp={handleSelectionChange}
             onMouseUp={handleSelectionChange}
@@ -304,7 +409,8 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           <div className="editor-bottom-bar">
             <button className="save-btn" onClick={handleSave}>保存</button>
             <button className="btn-outline" onClick={loadSnapshots}>历史版本</button>
-            <button className="next-chapter-btn" onClick={() => { handleSave(); goNext(); }}>
+            <button className="btn-outline" onClick={handleSyncOutline} disabled={loading || !text.trim()}>同步大纲</button>
+            <button className="next-chapter-btn" onClick={async () => { await handleSave(); goNext(); }}>
               保存并下一章 →
             </button>
           </div>
@@ -329,97 +435,9 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
               )}
             </div>
           )}
-        </div>
-        <div className="editor-panel">
-          <CreativeConstraintsPanel />
-          <div className="character-reference-panel">
-            <div className="character-reference-head">
-              <h4>角色参考</h4>
-              <span>{displayedCharacters.length} 人</span>
-            </div>
-            {displayedCharacters.length === 0 ? (
-              <div className="character-reference-empty">暂无角色数据，先去生成角色。</div>
-            ) : (
-              <>
-                <div className="character-reference-tabs">
-                  {displayedCharacters.map((c) => (
-                    <button key={c.id} className={`constraint-chip ${selectedCharacter?.id === c.id ? "active" : ""}`} onClick={() => setSelectedCharacterId(c.id)}>
-                      {c.name}
-                    </button>
-                  ))}
-                </div>
-                {selectedCharacter && (
-                  <div className="character-reference-card">
-                    <div className="character-reference-title-row">
-                      <strong>{selectedCharacter.name}</strong>
-                      <span className="tag">{selectedCharacter.role || "角色"}</span>
-                    </div>
-                    {selectedCharacter.personality && <p><b>性格：</b>{selectedCharacter.personality}</p>}
-                    {selectedCharacter.motivations?.length ? <p><b>动机：</b>{selectedCharacter.motivations.join("、")}</p> : null}
-                    {selectedCharacter.faction ? <p><b>阵营：</b>{selectedCharacter.faction}</p> : null}
-                    {selectedCharacter.arc?.internal_conflict ? <p><b>内在冲突：</b>{selectedCharacter.arc.internal_conflict}</p> : null}
-                    {selectedCharacter.relationships?.length ? (
-                      <div className="character-reference-relations">
-                        <b>关系：</b>
-                        {selectedCharacter.relationships.slice(0, 4).map((rel, idx) => (
-                          <span key={idx} className="rel-tag">{rel.target || "角色"}{rel.rel_type ? `（${rel.rel_type}）` : ""}</span>
-                        ))}
-                      </div>
-                    ) : null}
-                    {chapterNotes.length > 0 && (
-                      <div className="character-note-box">
-                        <strong>本章写作注意事项</strong>
-                        <ul>
-                          {chapterNotes.map((note, idx) => <li key={idx}>{note}</li>)}
-                        </ul>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
 
-          {/* Compact Tracking Panels */}
-          {chapterContext && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
-              {/* Character States */}
-              {Array.isArray(chapterContext.character_states) && chapterContext.character_states.length > 0 && (
-                <div className="tracking-compact-panel">
-                  <div className="tracking-compact-head" onClick={() => setShowStates(!showStates)}>
-                    <h4>前情状态 ({chapterContext.character_states.length})</h4>
-                    <span>{showStates ? "▼" : "▶"}</span>
-                  </div>
-                  {showStates && (
-                    <div className="tracking-compact-body">
-                      {chapterContext.character_states.slice(-8).map((s: any, i: number) => (
-                        <div key={i} className="tracking-compact-item">
-                          <strong>{s.name}</strong>：{s.change} <span className="dim">（第{s.chapter}章）</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {/* Active Foreshadowing */}
-              {Array.isArray(chapterContext.active_foreshadowing) && chapterContext.active_foreshadowing.length > 0 && (
-                <div className="tracking-compact-panel">
-                  <div className="tracking-compact-head" onClick={() => setShowForeshadowing(!showForeshadowing)}>
-                    <h4>活跃伏笔 <span className="tag">{chapterContext.active_foreshadowing.length}</span></h4>
-                    <span>{showForeshadowing ? "▼" : "▶"}</span>
-                  </div>
-                  {showForeshadowing && (
-                    <div className="tracking-compact-body">
-                      {chapterContext.active_foreshadowing.map((f: string, i: number) => (
-                        <span key={i} className="foreshadow-chip">{f}</span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
+          {/* AI 操作面板 - 移到保存按钮下方 */}
+          <div className="editor-operations-panel">
           <div className="mode-switch">
             <button className={mode === "fill" ? "active" : ""} onClick={() => setMode("fill")}>补足字数</button>
             <button className={mode === "partial" ? "active" : ""} onClick={() => setMode("partial")}>局部补写</button>
@@ -427,6 +445,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
             <button className={mode === "continue" ? "active" : ""} onClick={() => setMode("continue")}>逐段续写</button>
             <button className={mode === "review" ? "active" : ""} onClick={() => setMode("review")}>AI审校</button>
             <button className={mode === "reader" ? "active" : ""} onClick={() => setMode("reader")}>读者模拟</button>
+            <button className={mode === "sensitive" ? "active" : ""} onClick={() => setMode("sensitive")}>敏感词</button>
           </div>
 
           {mode === "review" ? (
@@ -490,6 +509,40 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
                     </div>
                   )}
                   <div className="reader-dimension dim">{readerResult.overall_feel}</div>
+                </div>
+              )}
+            </>
+          ) : mode === "sensitive" ? (
+            <>
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <button onClick={handleLocalSensitivity} disabled={!text.trim()}>本地快速检测</button>
+                <button onClick={handleAiSensitivity} disabled={loading || !text.trim()}>
+                  {loading ? <><span className="loading-spinner" />AI 深度扫描</> : "AI 深度扫描"}
+                </button>
+              </div>
+              {sensitiveLocal && (
+                <div style={{ marginBottom: 12 }}>
+                  <h4 style={{ fontSize: 13, marginBottom: 6 }}>本地检测结果</h4>
+                  {sensitiveLocal.length === 0 ? (
+                    <p className="dim" style={{ fontSize: 12 }}>未发现敏感词</p>
+                  ) : sensitiveLocal.map((m, i) => (
+                    <div key={i} className="sensitivity-item">
+                      <strong>{m.word}</strong> <span className="dim">出现 {m.count} 次</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {sensitiveAi && (
+                <div>
+                  <h4 style={{ fontSize: 13, marginBottom: 6 }}>AI 深度扫描 — 风险等级：<span className={`risk-${sensitiveAi.risk_level}`}>{sensitiveAi.risk_level}</span></h4>
+                  <p className="dim" style={{ fontSize: 12, marginBottom: 8 }}>{sensitiveAi.summary}</p>
+                  {Array.isArray(sensitiveAi.issues) && sensitiveAi.issues.map((issue: any, i: number) => (
+                    <div key={i} className="sensitivity-item">
+                      <div><strong>{issue.category}</strong> · {issue.location} · <span className={`risk-${issue.risk_level}`}>{issue.risk_level}</span></div>
+                      <div style={{ fontSize: 12 }}>{issue.content}</div>
+                      {issue.suggestion && <div className="dim" style={{ fontSize: 11 }}>建议：{issue.suggestion}</div>}
+                    </div>
+                  ))}
                 </div>
               )}
             </>
@@ -583,6 +636,98 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
               )}
             </>
           )}
+          </div>
+        </div>
+        <div className="editor-panel">
+          <CreativeConstraintsPanel />
+          <div className="character-reference-panel">
+            <div className="character-reference-head">
+              <h4>角色参考</h4>
+              <span>{displayedCharacters.length} 人</span>
+            </div>
+            {displayedCharacters.length === 0 ? (
+              <div className="character-reference-empty">暂无角色数据，先去生成角色。</div>
+            ) : (
+              <>
+                <div className="character-reference-tabs">
+                  {displayedCharacters.map((c) => (
+                    <button key={c.id} className={`constraint-chip ${selectedCharacter?.id === c.id ? "active" : ""}`} onClick={() => setSelectedCharacterId(c.id)}>
+                      {c.name}
+                    </button>
+                  ))}
+                </div>
+                {selectedCharacter && (
+                  <div className="character-reference-card">
+                    <div className="character-reference-title-row">
+                      <strong>{selectedCharacter.name}</strong>
+                      <span className="tag">{selectedCharacter.role || "角色"}</span>
+                    </div>
+                    {selectedCharacter.personality && <p><b>性格：</b>{selectedCharacter.personality}</p>}
+                    {selectedCharacter.motivations?.length ? <p><b>动机：</b>{selectedCharacter.motivations.join("、")}</p> : null}
+                    {selectedCharacter.faction ? <p><b>阵营：</b>{selectedCharacter.faction}</p> : null}
+                    {selectedCharacter.arc?.internal_conflict ? <p><b>内在冲突：</b>{selectedCharacter.arc.internal_conflict}</p> : null}
+                    {selectedCharacter.relationships?.length ? (
+                      <div className="character-reference-relations">
+                        <b>关系：</b>
+                        {selectedCharacter.relationships.slice(0, 4).map((rel, idx) => (
+                          <span key={idx} className="rel-tag">{rel.target || "角色"}{rel.rel_type ? `（${rel.rel_type}）` : ""}</span>
+                        ))}
+                      </div>
+                    ) : null}
+                    {chapterNotes.length > 0 && (
+                      <div className="character-note-box">
+                        <strong>本章写作注意事项</strong>
+                        <ul>
+                          {chapterNotes.map((note, idx) => <li key={idx}>{note}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Compact Tracking Panels */}
+          {chapterContext && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+              {/* Character States */}
+              {Array.isArray(chapterContext.character_states) && chapterContext.character_states.length > 0 && (
+                <div className="tracking-compact-panel">
+                  <div className="tracking-compact-head" onClick={() => setShowStates(!showStates)}>
+                    <h4>前情状态 ({chapterContext.character_states.length})</h4>
+                    <span>{showStates ? "▼" : "▶"}</span>
+                  </div>
+                  {showStates && (
+                    <div className="tracking-compact-body">
+                      {chapterContext.character_states.slice(-8).map((s: any, i: number) => (
+                        <div key={i} className="tracking-compact-item">
+                          <strong>{s.name}</strong>：{s.change} <span className="dim">（第{s.chapter}章）</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Active Foreshadowing */}
+              {Array.isArray(chapterContext.active_foreshadowing) && chapterContext.active_foreshadowing.length > 0 && (
+                <div className="tracking-compact-panel">
+                  <div className="tracking-compact-head" onClick={() => setShowForeshadowing(!showForeshadowing)}>
+                    <h4>活跃伏笔 <span className="tag">{chapterContext.active_foreshadowing.length}</span></h4>
+                    <span>{showForeshadowing ? "▼" : "▶"}</span>
+                  </div>
+                  {showForeshadowing && (
+                    <div className="tracking-compact-body">
+                      {chapterContext.active_foreshadowing.map((f: string, i: number) => (
+                        <span key={i} className="foreshadow-chip">{f}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
       </div>
     </div>
