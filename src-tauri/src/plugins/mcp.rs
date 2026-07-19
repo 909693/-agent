@@ -443,13 +443,10 @@ pub fn save_mcp_server(server: Value) -> Result<Value, String> {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| record.install_path.clone());
     }
-    if record.log_path.is_empty() {
-        record.log_path = existing
-            .as_ref()
-            .map(|v| v.log_path.clone())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| log_path_for(&record.id).to_string_lossy().to_string());
-    }
+    // log_path is an internal, id-derived path and must never be client-controlled:
+    // a supplied absolute path would let a saved config truncate (on log open) or
+    // read (via the log viewer) an arbitrary file. Always derive it from the id.
+    record.log_path = log_path_for(&record.id).to_string_lossy().to_string();
     if record.command.is_empty() {
         if let Some(old) = &existing {
             record.command = old.command.clone();
@@ -548,7 +545,9 @@ pub fn start_mcp_server(server_id: String) -> Result<Value, String> {
     // Log the operation
     crate::storage::log_mcp_start(&server_id, &records[i].command);
 
-    // Check if already running in process manager
+    // Hold the process-manager lock across the whole check-then-spawn so two
+    // concurrent starts can't both pass the liveness check and spawn duplicate,
+    // orphaned processes (TOCTOU).
     {
         let mut pm = PROCESS_MANAGER.lock().map_err(|e| e.to_string())?;
         if let Some(child) = pm.get_mut(&server_id) {
@@ -563,29 +562,23 @@ pub fn start_mcp_server(server_id: String) -> Result<Value, String> {
                 pm.remove(&server_id);
             }
         }
-    }
 
-    // Check legacy PID (for processes started before this fix)
-    if let Some(pid) = records[i].pid {
-        if is_alive(pid) {
-            records[i].running = true;
-            save_registry(&records)?;
-            return serde_json::to_value(records[i].clone()).map_err(|e| e.to_string());
+        // Check legacy PID (for processes started before Child-handle tracking)
+        if let Some(pid) = records[i].pid {
+            if is_alive(pid) {
+                records[i].running = true;
+                save_registry(&records)?;
+                return serde_json::to_value(records[i].clone()).map_err(|e| e.to_string());
+            }
         }
-    }
 
-    // Spawn new process BEFORE updating state
-    let child = spawn_server(&records[i], true)?;
-    let pid = child.id();
-
-    // Update state only after successful spawn
-    {
-        let mut pm = PROCESS_MANAGER.lock().map_err(|e| e.to_string())?;
+        // Spawn while still holding the lock, then record the handle atomically.
+        let child = spawn_server(&records[i], true)?;
+        let pid = child.id();
         pm.insert(server_id.clone(), child);
+        records[i].pid = Some(pid);
+        records[i].running = true;
     }
-
-    records[i].pid = Some(pid);
-    records[i].running = true;
     save_registry(&records)?;
 
     serde_json::to_value(records[i].clone()).map_err(|e| e.to_string())

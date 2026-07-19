@@ -4,6 +4,9 @@ mod audit;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::sync::{Arc, Mutex, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
@@ -18,6 +21,29 @@ pub use audit::{
 };
 
 static CUSTOM_DATA_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Monotonic counter for unique temp-file / snapshot names, so concurrent atomic
+/// writes to the same target never clobber each other's temp file.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-project locks serializing read-modify-write sequences on shared aggregate
+/// JSON files (e.g. chapter_summaries.json) to prevent lost updates.
+static PROJECT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn unique_tmp_name(base: &str) -> String {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".{}.{}.{}.tmp", base, std::process::id(), n)
+}
+
+/// Acquire the per-project lock. Hold the returned guard across a
+/// load → modify → save sequence to serialize concurrent writers.
+pub fn project_lock(project_id: &str) -> Arc<Mutex<()>> {
+    let mut map = PROJECT_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(project_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Get the directory where the executable lives
 fn exe_dir() -> PathBuf {
@@ -260,12 +286,19 @@ pub fn save_json(project_id: &str, filename: &str, data: &Value) -> Result<(), S
     let dir = project_dir(project_id);
     let path = dir.join(&safe_filename);
     let content = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    // Atomic write: write to temp file then rename to prevent corruption
-    let tmp_path = dir.join(format!(".{}.tmp", safe_filename));
+    // Atomic write: write to a UNIQUE temp file then rename. A unique name is
+    // essential — a fixed `.name.tmp` lets two concurrent writers to the same
+    // target clobber each other's temp file (corruption / spurious ENOENT).
+    let tmp_path = dir.join(unique_tmp_name(&safe_filename));
     fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-    // On Windows, fs::rename fails if destination exists; remove it first
-    if path.exists() {
-        let _ = fs::remove_file(&path);
+    // On Windows, fs::rename fails if destination exists; remove it first.
+    // On POSIX, rename atomically replaces, so we must NOT pre-remove (that would
+    // create a window where a concurrent reader sees no file).
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
     }
     fs::rename(&tmp_path, &path).map_err(|e| {
         // Cleanup tmp on rename failure
@@ -326,8 +359,11 @@ pub fn delete_project(project_id: &str) -> Result<(), String> {
 pub fn save_snapshot(project_id: &str, chapter_number: u32, text: &str) -> Result<(), String> {
     let snap_dir = project_dir(project_id).join("snapshots");
     fs::create_dir_all(&snap_dir).map_err(|e| e.to_string())?;
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let filename = format!("chapter_{:03}_{}.json", chapter_number, timestamp);
+    // Millisecond timestamp + monotonic seq so two snapshots of the same chapter
+    // within the same second (e.g. autosave racing a manual save) never collide.
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!("chapter_{:03}_{}_{}.json", chapter_number, timestamp, seq);
     let data = serde_json::json!({
         "text": text,
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -376,6 +412,55 @@ pub fn load_snapshot(project_id: &str, snapshot_file: &str) -> Result<Value, Str
     }
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+/// Swap the snapshot files of two chapters. Snapshots are named by chapter number
+/// (`chapter_{n:03}_...json`), so when a reorder swaps two chapters' text this
+/// keeps each chapter's version history following its content. Uses a dot-prefixed
+/// temp name (never matched by list_snapshots) for the three-step rename.
+pub fn swap_snapshots(project_id: &str, a: u32, b: u32) -> Result<(), String> {
+    if a == b {
+        return Ok(());
+    }
+    let snap_dir = project_dir(project_id).join("snapshots");
+    if !snap_dir.exists() {
+        return Ok(());
+    }
+    let prefix_a = format!("chapter_{:03}_", a);
+    let prefix_b = format!("chapter_{:03}_", b);
+    // Unique per-call token so a leftover temp file (e.g. from a crash mid-swap)
+    // can never be picked up by a later swap — pid alone can be reused.
+    let token = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_prefix = format!(".swaptmp_{}_{}_", std::process::id(), token);
+
+    let entries: Vec<String> = match fs::read_dir(&snap_dir) {
+        Ok(rd) => rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect(),
+        Err(_) => return Ok(()),
+    };
+    // Step 1: a's snapshots → temp. Record exactly what we moved so step 3 only
+    // touches this call's files (never a stray `.swaptmp_` orphan).
+    let mut moved: Vec<String> = Vec::new();
+    for name in &entries {
+        if let Some(rest) = name.strip_prefix(&prefix_a) {
+            if fs::rename(snap_dir.join(name), snap_dir.join(format!("{}{}", tmp_prefix, rest))).is_ok() {
+                moved.push(rest.to_string());
+            }
+        }
+    }
+    // Step 2: b's snapshots → a
+    for name in &entries {
+        if let Some(rest) = name.strip_prefix(&prefix_b) {
+            let _ = fs::rename(snap_dir.join(name), snap_dir.join(format!("{}{}", prefix_a, rest)));
+        }
+    }
+    // Step 3: temp (originally a's) → b, only the files this call moved.
+    for rest in &moved {
+        let _ = fs::rename(
+            snap_dir.join(format!("{}{}", tmp_prefix, rest)),
+            snap_dir.join(format!("{}{}", prefix_b, rest)),
+        );
+    }
+    Ok(())
 }
 
 // ===== LLM Config (app-level, not per-project) =====
@@ -435,13 +520,13 @@ pub fn load_llm_config() -> Result<Option<Value>, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("default");
 
-        // Try current provider first, then try all known providers
+        // Retrieve API key from keychain for the configured provider ONLY.
+        // Do NOT fall back to other providers' keys: the frontend writes the
+        // returned config back on startup, which would copy provider A's key
+        // into provider B's slot and could send it to the wrong endpoint.
         let api_key = keyring::get_api_key(provider)
             .ok()
             .flatten()
-            .or_else(|| keyring::get_api_key("openai").ok().flatten())
-            .or_else(|| keyring::get_api_key("anthropic").ok().flatten())
-            .or_else(|| keyring::get_api_key("gemini").ok().flatten())
             .unwrap_or_default();
 
         obj.insert("apiKey".to_string(), serde_json::json!(api_key));

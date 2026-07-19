@@ -394,6 +394,8 @@ pub async fn execute_tool(
                 hint, target_words, &context,
             ).await?;
             let chapter_file = format!("chapter_{:03}.json", num);
+            let lock = storage::project_lock(project_id);
+            let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
             if let Ok(Some(existing)) = storage::load_json(project_id, &chapter_file) {
                 let old = existing["text"].as_str().unwrap_or("");
                 if !old.is_empty() {
@@ -430,6 +432,18 @@ pub async fn execute_tool(
                 &format!("{}\n\n{}", truncate(constraints_text, 2000), instruction),
                 target_words, &context,
             ).await?;
+            // Persist under the project lock; re-read to avoid overwriting a change
+            // made during generation, and snapshot so the append is recoverable.
+            let lock = storage::project_lock(project_id);
+            let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let current = storage::load_json(project_id, &chapter_file)?
+                .ok_or_else(|| format!("第{}章内容缺失", num))?;
+            if current["text"].as_str().unwrap_or("") != existing_text {
+                return Err(format!("第{}章在生成期间被修改，续写已取消", num));
+            }
+            if !existing_text.is_empty() {
+                let _ = storage::save_snapshot(project_id, num, existing_text);
+            }
             let new_text = format!("{}\n\n{}", existing_text, result["text"].as_str().unwrap_or(""));
             let updated = json!({"text": new_text});
             storage::save_json(project_id, &chapter_file, &updated)?;

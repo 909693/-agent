@@ -26,13 +26,14 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
     setError("");
 
     try {
+      const safeTargetWords = Number.isFinite(targetWords) && targetWords > 0 ? Math.floor(targetWords) : 3000;
       const project = await api.createProject({
         title: title.trim(),
         genre,
         premise: premise.trim(),
         tone,
         themes: themes.split(/[,，、]/).map(t => t.trim()).filter(Boolean),
-        targetChapterWords: targetWords,
+        targetChapterWords: safeTargetWords,
       });
 
       onCreated(project);
@@ -49,7 +50,7 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
       <div className="dialog-content" onClick={e => e.stopPropagation()}>
         <div className="dialog-header">
           <h3>创建新小说</h3>
-          <button className="btn-close" onClick={onClose}>✕</button>
+          <button className="btn-close" onClick={onClose}>×</button>
         </div>
 
         <div className="dialog-body">
@@ -86,7 +87,7 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
               value={premise}
               onChange={e => setPremise(e.target.value)}
               rows={4}
-              placeholder="简要描述故事的核心设定和主线，例如：一逆天命，破苍穹。人族自主万古长 克整创框架·200万字体量规划 含：世界观·人物系统..."
+              placeholder="简要描述故事的核心设定和主线，例如：凡人少年偶获上古人皇传承，在宗门倾轧与天道压制中逆流而上，重写人族万古命运。"
             />
           </label>
 

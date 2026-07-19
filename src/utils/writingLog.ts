@@ -8,11 +8,17 @@ export interface DayLog {
 }
 
 function today(): string {
-  return new Date().toISOString().slice(0, 10);
+  // Use LOCAL date, not UTC — otherwise UTC+8 users writing between 0:00-8:00
+  // have their words counted toward the previous day (breaking stats & streaks).
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function thisMonth(): string {
-  return new Date().toISOString().slice(0, 7);
+  return today().slice(0, 7);
 }
 
 function loadLog(): DayLog[] {
@@ -55,17 +61,20 @@ export function getHistory(): DayLog[] {
 }
 
 export function getDailyGoal(): number {
-  return Number(localStorage.getItem(DAILY_GOAL_KEY)) || 5000;
+  const n = Number(localStorage.getItem(DAILY_GOAL_KEY));
+  return Number.isFinite(n) && n > 0 ? n : 5000;
 }
 
 export function setDailyGoal(n: number) {
-  localStorage.setItem(DAILY_GOAL_KEY, String(n));
+  // Clamp to a positive integer: a 0/negative goal yields NaN%/always-met streaks.
+  localStorage.setItem(DAILY_GOAL_KEY, String(Math.max(1, Math.floor(n) || 0)));
 }
 
 export function getMonthlyGoal(): number {
-  return Number(localStorage.getItem(MONTHLY_GOAL_KEY)) || 100000;
+  const n = Number(localStorage.getItem(MONTHLY_GOAL_KEY));
+  return Number.isFinite(n) && n > 0 ? n : 100000;
 }
 
 export function setMonthlyGoal(n: number) {
-  localStorage.setItem(MONTHLY_GOAL_KEY, String(n));
+  localStorage.setItem(MONTHLY_GOAL_KEY, String(Math.max(1, Math.floor(n) || 0)));
 }

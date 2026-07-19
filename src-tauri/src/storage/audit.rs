@@ -9,7 +9,10 @@ const MAX_LOG_SIZE: u64 = 10_000_000;
 /// Log a sensitive operation to the audit log
 pub fn log_operation(operation: &str, details: &str) {
     let timestamp = Utc::now().to_rfc3339();
-    let log_entry = format!("[{}] {} - {}\n", timestamp, operation, details);
+    // Strip CR/LF from user-controlled fields to prevent audit-log forging
+    // (injecting fake `[ts] OP - ...` lines via newlines in a project title etc.).
+    let sanitize = |s: &str| s.replace(['\n', '\r'], " ");
+    let log_entry = format!("[{}] {} - {}\n", timestamp, sanitize(operation), sanitize(details));
 
     let log_path = data_dir().join("audit.log");
 

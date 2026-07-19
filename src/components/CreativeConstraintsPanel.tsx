@@ -16,12 +16,13 @@ function loadPrompts(): PromptItem[] {
   }
 }
 
-export function CreativeConstraintsPanel({ onChange }: { onChange?: (payload: CreativeConstraintsPayload) => void }) {
+export function CreativeConstraintsPanel({ onChange, collapsible = false, defaultCollapsed = false }: { onChange?: (payload: CreativeConstraintsPayload) => void; collapsible?: boolean; defaultCollapsed?: boolean }) {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [prompts] = useState<PromptItem[]>(loadPrompts());
   const [selectedSkills, setSelectedSkills] = useState<string[]>(getCreativeConstraints().enabledSkillIds);
   const [selectedPrompts, setSelectedPrompts] = useState<string[]>(getCreativeConstraints().selectedPromptIds);
   const [mode, setMode] = useState<"strict" | "assist">(getCreativeConstraints().mode);
+  const [open, setOpen] = useState(!defaultCollapsed);
 
   useEffect(() => {
     api.listSkills().then((items: any) => {
@@ -43,8 +44,8 @@ export function CreativeConstraintsPanel({ onChange }: { onChange?: (payload: Cr
     setter(list.includes(id) ? list.filter(x => x !== id) : [...list, id]);
   };
 
-  return (
-    <div className="constraints-panel">
+  const body = (
+    <>
       <div className="constraints-head">
         <h4>创作约束</h4>
         <select value={mode} onChange={e => setMode(e.target.value as "strict" | "assist")}>
@@ -65,13 +66,31 @@ export function CreativeConstraintsPanel({ onChange }: { onChange?: (payload: Cr
       <div className="constraints-block">
         <span className="constraints-label">提示词</span>
         <div className="constraints-chips">
-          {prompts.length === 0 ? <span className="constraints-empty">无可用提示词</span> : prompts.slice(0, 12).map(p => (
+          {prompts.length === 0 ? <span className="constraints-empty">无可用提示词</span> : prompts.map(p => (
             <button key={p.id} type="button" className={`constraint-chip ${selectedPrompts.includes(p.id) ? "active" : ""}`} onClick={() => toggle(p.id, selectedPrompts, setSelectedPrompts)}>
               {p.title}
             </button>
           ))}
         </div>
       </div>
-    </div>
+    </>
+  );
+
+  if (collapsible) {
+    const summary = `${mode === "strict" ? "严格模式" : "参考模式"} · Skills ${selectedSkills.length} · 提示词 ${selectedPrompts.length}`;
+    return (
+      <div className={`constraints-panel collapsible ${open ? "open" : ""}`}>
+        <button type="button" className="constraints-toggle" onClick={() => setOpen(v => !v)}>
+          <span className="constraints-toggle-title">创作约束</span>
+          <span className="constraints-toggle-summary">{summary}</span>
+          <span className={`constraints-chevron ${open ? "open" : ""}`}>▾</span>
+        </button>
+        {open && <div className="constraints-body">{body}</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="constraints-panel">{body}</div>
   );
 }

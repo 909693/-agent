@@ -56,12 +56,24 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const [partialHint, setPartialHint] = useState("");
   const [partialDelta, setPartialDelta] = useState(300);
   const [partialPreview, setPartialPreview] = useState("");
-  const [autoSaveStatus, setAutoSaveStatus] = useState<"" | "saving" | "saved">("");
+  const [autoSaveStatus, setAutoSaveStatus] = useState<"" | "saving" | "saved" | "error">("");
   const prevWordCount = useRef(0);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const loadedTextRef = useRef("");
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevChapterRef = useRef({ projectId, chapterNum, text: "" });
+  // Always holds the latest values needed to flush unsaved edits on unmount.
+  const flushRef = useRef({ projectId, chapterNum, text: "", loaded: "" });
+  // False while a chapter switch is loading (chapterNum changed but text /
+  // loadedTextRef not yet updated), so the unmount flush won't write the old
+  // chapter's text under the new chapter number.
+  const chapterHydratedRef = useRef(true);
+  // Monotonic load id: a getChapter response only applies if it's still the latest
+  // request, so rapid switches can't let a stale response clobber state / hydrate.
+  const loadSeqRef = useRef(0);
+  // Selection frozen when a partial-rewrite preview is generated, bound to the
+  // chapter it was taken from.
+  const rewriteRangeRef = useRef<{ start: number; end: number; original: string; chapterNum: number } | null>(null);
   const [chapterContext, setChapterContext] = useState<any>(null);
   const [showStates, setShowStates] = useState(false);
   const [showForeshadowing, setShowForeshadowing] = useState(false);
@@ -92,12 +104,14 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       clearTimeout(autoSaveTimerRef.current);
       autoSaveTimerRef.current = null;
     }
-    // Save previous chapter's unsaved changes (using refs which hold previous values)
-    if (loadedTextRef.current !== "" && prevChapterRef.current.text !== loadedTextRef.current) {
-      // text was modified but not yet saved — flush it
+    // Save previous chapter's unsaved changes (refs still hold the previous
+    // chapter's values here). Flush whenever the edited text differs from what
+    // was loaded — including a brand-new chapter (loadedText === "") so a draft
+    // typed within the 3s debounce window isn't lost on switch.
+    {
       const prev = prevChapterRef.current;
-      if (prev.text && prev.text !== loadedTextRef.current) {
-        api.saveChapter(prev.projectId, prev.chapterNum, prev.text).catch(() => {});
+      if (prev.text.trim() !== "" && prev.text !== loadedTextRef.current) {
+        api.saveChapter(prev.projectId, prev.chapterNum, prev.text, false).catch(() => {});
       }
     }
     // Reset all AI results when switching chapters
@@ -107,19 +121,24 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     setSensitiveLocal(null);
     setSensitiveAi(null);
     setPartialPreview("");
+    rewriteRangeRef.current = null;
     setSelectionText("");
     setSelectionStart(0);
     setSelectionEnd(0);
     setAutoSaveStatus("");
+    chapterHydratedRef.current = false;
+    const seq = ++loadSeqRef.current;
     api.getChapter(projectId, chapterNum)
       .then((d: any) => {
+        if (seq !== loadSeqRef.current) return; // superseded by a newer switch
         const t = d.text || "";
         setText(t);
         loadedTextRef.current = t;
         prevWordCount.current = t.length;
         prevChapterRef.current = { projectId, chapterNum, text: t };
+        chapterHydratedRef.current = true;
       })
-      .catch(() => { setText(""); loadedTextRef.current = ""; prevWordCount.current = 0; prevChapterRef.current = { projectId, chapterNum, text: "" }; });
+      .catch(() => { if (seq !== loadSeqRef.current) return; setText(""); loadedTextRef.current = ""; prevWordCount.current = 0; prevChapterRef.current = { projectId, chapterNum, text: "" }; chapterHydratedRef.current = true; });
   }, [projectId, chapterNum]);
 
   useEffect(() => {
@@ -140,7 +159,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     autoSaveTimerRef.current = setTimeout(async () => {
       setAutoSaveStatus("saving");
       try {
-        await api.saveChapter(projectId, chapterNum, text);
+        await api.saveChapter(projectId, chapterNum, text, false);
         const delta = text.length - prevWordCount.current;
         if (delta > 0) logWords(delta);
         prevWordCount.current = text.length;
@@ -150,7 +169,9 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
         // Clear "已自动保存" indicator after 2 seconds
         setTimeout(() => setAutoSaveStatus(""), 2000);
       } catch {
-        setAutoSaveStatus("");
+        // Surface the failure instead of swallowing it silently.
+        setAutoSaveStatus("error");
+        setTimeout(() => setAutoSaveStatus(""), 4000);
       }
     }, 3000);
 
@@ -161,6 +182,26 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       }
     };
   }, [text, projectId, chapterNum]);
+
+  // Keep the flush ref current so the unmount handler can persist the latest edits.
+  useEffect(() => {
+    flushRef.current = { projectId, chapterNum, text, loaded: loadedTextRef.current };
+  });
+
+  // Flush unsaved edits when the editor unmounts (e.g. clicking 返回 before the
+  // 3s debounce fires) so the last few seconds of typing aren't lost.
+  useEffect(() => {
+    return () => {
+      // Skip if a chapter switch is mid-load: chapterNum would point at the new
+      // chapter while text still holds the old one (whose edits were already
+      // flushed by the switch effect above).
+      if (!chapterHydratedRef.current) return;
+      const f = flushRef.current;
+      if (f.text.trim() !== "" && f.text !== f.loaded) {
+        api.saveChapter(f.projectId, f.chapterNum, f.text, false).catch(() => {});
+      }
+    };
+  }, []);
 
   const currentChapter = chapters.find(c => c.number === chapterNum);
   const displayedCharacters = useMemo(() => {
@@ -197,8 +238,14 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       const existingContext = text.trim() ? `以下是我已经写好的正文，请严格保留已写内容的核心情节和表达方向，只在不足处补充扩写：\n\n${text}` : "";
       const hintContext = fillHint.trim() ? `\n\n补充要求：${fillHint}` : "";
       const result: any = await api.expandChapter(projectId, chapterNum, `${existingContext}${hintContext}`, targetWords, llm, payload);
-      setText(result.text || JSON.stringify(result));
-      setSaved(false);
+      // Backend persisted the result — sync refs so a later chapter-switch flush
+      // can't overwrite this AI content with a stale prevChapterRef draft.
+      const t = result.text || JSON.stringify(result);
+      setText(t);
+      loadedTextRef.current = t;
+      prevWordCount.current = t.length;
+      prevChapterRef.current = { projectId, chapterNum, text: t };
+      setSaved(true);
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(false); }
   };
@@ -209,8 +256,12 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     try {
       const payload = await buildCreativeConstraintsPayload();
       const result: any = await api.expandChapter(projectId, chapterNum, userInput, targetWords, llm, payload);
-      setText(result.text || JSON.stringify(result));
-      setSaved(false);
+      const t = result.text || JSON.stringify(result);
+      setText(t);
+      loadedTextRef.current = t;
+      prevWordCount.current = t.length;
+      prevChapterRef.current = { projectId, chapterNum, text: t };
+      setSaved(true);
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(false); }
   };
@@ -219,10 +270,22 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     if (!llm.apiKey) { setError("请先配置 API Key"); return; }
     setLoading(true); setError("");
     try {
+      // continueWriting reads the chapter from disk, so persist unsaved edits
+      // first — otherwise text typed within the debounce window is discarded.
+      if (text !== loadedTextRef.current) {
+        await api.saveChapter(projectId, chapterNum, text, false);
+        loadedTextRef.current = text;
+      }
       const payload = await buildCreativeConstraintsPayload();
       const result: any = await api.continueWriting(projectId, chapterNum, instruction, targetWords, llm, payload);
-      setText(result.text || JSON.stringify(result));
-      setSaved(false);
+      // Backend appended + persisted — sync refs so a later switch flush can't
+      // overwrite this with a stale draft.
+      const t = result.text || JSON.stringify(result);
+      setText(t);
+      loadedTextRef.current = t;
+      prevWordCount.current = t.length;
+      prevChapterRef.current = { projectId, chapterNum, text: t };
+      setSaved(true);
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(false); }
   };
@@ -287,12 +350,16 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
   const handlePartialRewrite = async () => {
     if (!llm.apiKey) { setError("请先配置 API Key"); return; }
     if (!selectionText.trim()) { setError("请先在正文中选中一段内容"); return; }
+    // Freeze the selection (bound to this chapter) now; the user may click
+    // elsewhere or switch chapters while the preview generates.
+    const myRange = { start: selectionStart, end: selectionEnd, original: selectionText, chapterNum };
+    rewriteRangeRef.current = myRange;
     setLoading(true); setError("");
     try {
       const payload = await buildCreativeConstraintsPayload();
       const result: any = await api.rewriteSelection(projectId, chapterNum, selectionText, partialHint, partialDelta, llm, payload);
-      const replacement = result.text || "";
-      setPartialPreview(replacement);
+      if (rewriteRangeRef.current !== myRange) return; // switched chapters / re-rewritten → drop
+      setPartialPreview(result.text || "");
       setSaved(false);
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(false); }
@@ -300,17 +367,36 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
 
   const applyPartialRewrite = () => {
     if (!partialPreview) return;
-    // Re-validate selection positions against current text
-    const safeStart = Math.min(selectionStart, text.length);
-    const safeEnd = Math.min(selectionEnd, text.length);
-    const newText = text.slice(0, safeStart) + partialPreview + text.slice(safeEnd);
+    const range = rewriteRangeRef.current;
+    if (!range || range.chapterNum !== chapterNum) { setError("补写会话已失效，请重新生成预览"); return; }
+    // Use the selection frozen when the preview was generated. If the text has
+    // since shifted, relocate the original snippet instead of trusting offsets.
+    let start = range.start;
+    let end = range.end;
+    if (text.slice(start, end) !== range.original) {
+      // Text shifted since the preview was generated. Relocate to the occurrence
+      // CLOSEST to the frozen start — blindly taking the first match would replace
+      // the wrong copy when the selected snippet appears more than once.
+      const occurrences: number[] = [];
+      for (let idx = text.indexOf(range.original); idx >= 0; idx = text.indexOf(range.original, idx + 1)) {
+        occurrences.push(idx);
+      }
+      if (occurrences.length === 0) { setError("原文已改变，无法自动替换，请重新选择并生成"); return; }
+      const best = occurrences.reduce((p, q) => Math.abs(q - range.start) < Math.abs(p - range.start) ? q : p);
+      start = best;
+      end = best + range.original.length;
+    }
+    const newText = text.slice(0, start) + partialPreview + text.slice(end);
     setText(newText);
-    setSelectionText(partialPreview);
+    // Track the applied (unsaved) text so a chapter-switch flush persists it
+    // rather than the stale pre-rewrite draft.
+    prevChapterRef.current = { projectId, chapterNum, text: newText };
     setPartialPreview("");
+    rewriteRangeRef.current = null;
     setSaved(false);
   };
 
-  const handleSave = async () => {
+  const handleSave = async (): Promise<boolean> => {
     try {
       // Cancel any pending auto-save
       if (autoSaveTimerRef.current) {
@@ -322,10 +408,12 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
       if (delta > 0) logWords(delta);
       prevWordCount.current = text.length;
       loadedTextRef.current = text;
+      prevChapterRef.current = { projectId, chapterNum, text };
       setSaved(true);
       setAutoSaveStatus("");
       setError("");
-    } catch (e: any) { setError(e.toString()); }
+      return true;
+    } catch (e: any) { setError(e.toString()); return false; }
   };
 
   const loadSnapshots = async () => {
@@ -340,9 +428,13 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     if (!confirm("确定恢复此版本？当前内容将被备份后替换。")) return;
     try {
       const result: any = await api.restoreSnapshot(projectId, chapterNum, file);
-      setText(result.text || "");
-      loadedTextRef.current = result.text || "";
-      prevWordCount.current = (result.text || "").length;
+      const restored = result.text || "";
+      setText(restored);
+      loadedTextRef.current = restored;
+      prevWordCount.current = restored.length;
+      // Sync prevChapterRef too, else the chapter-switch flush writes the
+      // pre-restore text back over the restored version, undoing the restore.
+      prevChapterRef.current = { projectId, chapterNum, text: restored };
       setSaved(true);
       setShowSnapshots(false);
     } catch (e: any) { setError(e.toString()); }
@@ -379,9 +471,10 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           </select>
           <button onClick={goNext}>→</button>
           <span className="word-count">{wordCount} 字</span>
-          {saved && <span className="saved-tag">✓ 已保存</span>}
+          {saved && <span className="saved-tag">已保存</span>}
           {autoSaveStatus === "saving" && <span className="saved-tag" style={{ color: "#f59e0b" }}>自动保存中...</span>}
           {autoSaveStatus === "saved" && <span className="saved-tag" style={{ color: "#22c55e" }}>已自动保存</span>}
+          {autoSaveStatus === "error" && <span className="saved-tag" style={{ color: "#ef4444" }}>自动保存失败</span>}
         </div>
       </div>
 
@@ -410,7 +503,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
             <button className="save-btn" onClick={handleSave}>保存</button>
             <button className="btn-outline" onClick={loadSnapshots}>历史版本</button>
             <button className="btn-outline" onClick={handleSyncOutline} disabled={loading || !text.trim()}>同步大纲</button>
-            <button className="next-chapter-btn" onClick={async () => { await handleSave(); goNext(); }}>
+            <button className="next-chapter-btn" onClick={async () => { if (await handleSave()) goNext(); }}>
               保存并下一章 →
             </button>
           </div>
@@ -639,7 +732,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           </div>
         </div>
         <div className="editor-panel">
-          <CreativeConstraintsPanel />
+          <CreativeConstraintsPanel collapsible />
           <div className="character-reference-panel">
             <div className="character-reference-head">
               <h4>角色参考</h4>

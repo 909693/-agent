@@ -92,13 +92,30 @@ where
     }
     let content = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
 
-    // Atomic write: write to temp file then rename
-    let tmp_path = path.with_extension("tmp");
+    // Atomic write with a UNIQUE temp file. `with_extension("tmp")` produced a
+    // fixed sibling name, so two concurrent writers (e.g. two MCP-registry
+    // updates) clobbered each other's temp file. Use a per-target unique suffix.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WJ_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = WJ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        "{}.{}.{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("data"),
+        std::process::id(),
+        n
+    );
+    let tmp_path = path.with_file_name(tmp_name);
     fs::write(&tmp_path, &content).map_err(|e| e.to_string())?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
     }
-    fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        e.to_string()
+    })?;
     Ok(())
 }
 

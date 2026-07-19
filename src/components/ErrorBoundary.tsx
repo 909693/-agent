@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { AlertTriangle } from "lucide-react";
 
 interface Props {
   children: ReactNode;
@@ -39,13 +40,13 @@ export class ErrorBoundary extends Component<Props, State> {
             height: "100vh",
             fontFamily:
               '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-            background: "#fafafa",
-            color: "#333",
+            background: "#f5f5f7",
+            color: "#1d1d1f",
             padding: 24,
             textAlign: "center",
           }}
         >
-          <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
+          <AlertTriangle size={48} color="#FF9500" style={{ marginBottom: 16 }} />
           <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
             应用出现异常，请刷新重试
           </h1>
@@ -67,16 +68,16 @@ export class ErrorBoundary extends Component<Props, State> {
               fontWeight: 500,
               border: "none",
               borderRadius: 8,
-              background: "#4f46e5",
+              background: "#007AFF",
               color: "#fff",
               cursor: "pointer",
               transition: "background 0.2s",
             }}
             onMouseOver={(e) =>
-              ((e.target as HTMLButtonElement).style.background = "#4338ca")
+              ((e.target as HTMLButtonElement).style.background = "#005FCC")
             }
             onMouseOut={(e) =>
-              ((e.target as HTMLButtonElement).style.background = "#4f46e5")
+              ((e.target as HTMLButtonElement).style.background = "#007AFF")
             }
           >
             刷新

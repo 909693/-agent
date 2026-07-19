@@ -46,6 +46,21 @@ fn truncate_content(s: &str, max_chars: usize) -> String {
     format!("{}...(已截断)", truncated)
 }
 
+/// Move a cut index forward so the "recent" slice never begins with a
+/// ToolResultMsg. Otherwise its matching tool_use ends up in the summarized/
+/// dropped part, leaving an orphan tool_result that makes Anthropic/OpenAI
+/// reject the next request with a 400.
+fn adjust_cut_past_tool_results(messages: &[AgentMsg], mut cut: usize) -> usize {
+    while cut < messages.len() {
+        if matches!(messages[cut], AgentMsg::ToolResultMsg { .. }) {
+            cut += 1;
+        } else {
+            break;
+        }
+    }
+    cut
+}
+
 pub fn compact_conversation(messages: &[AgentMsg], max_tokens: usize) -> Vec<AgentMsg> {
     let total: usize = messages.iter().map(|m| msg_tokens(m)).sum();
     if total <= max_tokens {
@@ -55,6 +70,8 @@ pub fn compact_conversation(messages: &[AgentMsg], max_tokens: usize) -> Vec<Age
     let n = messages.len();
     let keep_recent = 6.min(n);
     let old_count = n.saturating_sub(keep_recent);
+    // Don't let the recent slice start with an orphan tool_result.
+    let old_count = adjust_cut_past_tool_results(messages, old_count);
 
     if old_count == 0 {
         return messages.to_vec();
@@ -120,15 +137,17 @@ pub fn aggressive_compact(messages: &[AgentMsg], max_tokens: usize) -> Vec<Agent
 
     let n = messages.len();
     let keep = 4.min(n);
+    // Start the kept tail at a non-tool-result so we never orphan a tool_result.
+    let cut = adjust_cut_past_tool_results(messages, n.saturating_sub(keep));
     let mut result: Vec<AgentMsg> = Vec::new();
 
-    if n > keep {
+    if cut > 0 {
         result.push(AgentMsg::User {
             content: "[之前的对话已被压缩以适应上下文限制]".to_string(),
         });
     }
 
-    for msg in &messages[n.saturating_sub(keep)..] {
+    for msg in &messages[cut..] {
         match msg {
             AgentMsg::ToolResultMsg { tool_use_id, content } => {
                 result.push(AgentMsg::ToolResultMsg {

@@ -1,3 +1,4 @@
+import { BookOpen, CalendarDays, FileUp, Plus } from "lucide-react";
 import type { ProjectMeta } from "../api";
 
 interface Props {
@@ -18,15 +19,21 @@ export function NovelList({ projects, onNewNovel, onImportOutline, onSelectNovel
     <div>
       <div className="page-header">
         <h2>小说列表</h2>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn-outline" onClick={onImportOutline}>📄 从大纲导入</button>
-          <button className="btn-primary" onClick={onNewNovel}>+ 创建新小说</button>
+        <div className="toolbar-actions">
+          <button className="btn-outline" onClick={onImportOutline}>
+            <FileUp size={15} style={{ verticalAlign: -2, marginRight: 5 }} />
+            从大纲导入
+          </button>
+          <button className="btn-primary" onClick={onNewNovel}>
+            <Plus size={16} style={{ verticalAlign: -2, marginRight: 4 }} />
+            创建新小说
+          </button>
         </div>
       </div>
 
       {projects.length === 0 ? (
         <div className="empty-state">
-          <div className="empty-icon">📚</div>
+          <div className="empty-icon"><BookOpen size={28} /></div>
           <p>还没有小说，点击上方按钮开始创作</p>
         </div>
       ) : (
@@ -35,12 +42,12 @@ export function NovelList({ projects, onNewNovel, onImportOutline, onSelectNovel
             <div key={p.id} className="novel-card" onClick={() => onSelectNovel(p)}>
               <div className="novel-card-header">
                 <h3>{p.title}</h3>
-                <button className="btn-danger" onClick={e => { e.stopPropagation(); onDeleteNovel(p.id); }}>删除</button>
+                <button className="btn-danger" onClick={e => { e.stopPropagation(); if (confirm(`确定删除《${p.title}》？此操作不可恢复，将永久删除该书的全部章节与历史版本。`)) onDeleteNovel(p.id); }}>删除</button>
               </div>
               <span className="genre-tag">{genreLabels[p.genre] || p.genre}</span>
               {p.premise && <p className="premise">{p.premise}</p>}
               <div className="novel-card-footer">
-                <span>📅 {p.created_at?.slice(0, 10)}</span>
+                <span className="meta-with-icon"><CalendarDays size={14} />{p.created_at?.slice(0, 10)}</span>
               </div>
             </div>
           ))}

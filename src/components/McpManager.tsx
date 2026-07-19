@@ -28,7 +28,7 @@ const getArray = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for
 const getError = (e: unknown) => e instanceof Error ? e.message : "操作失败";
 const repoName = (url: string) => url.replace(/\/+$/, "").split("/").filter(Boolean).slice(-1)[0] || "未命名";
 const getList = (v: unknown) => Array.isArray(v) ? v : Array.isArray(asRecord(v).servers) ? (asRecord(v).servers as unknown[]) : Array.isArray(asRecord(v).items) ? (asRecord(v).items as unknown[]) : [];
-const parseArgs = (value: string) => value.split(/\r?\n|,/).map(x => x.trim()).filter(Boolean);
+const parseArgs = (value: string) => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
 const normalizeEnv = (value: unknown): Record<string, string> => {
   const source = asRecord(value);
   return Object.entries(source).reduce<Record<string, string>>((acc, [key, val]) => {

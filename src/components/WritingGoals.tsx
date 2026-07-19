@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { BarChart3, Flame, PenLine, Trophy } from "lucide-react";
 import {
   getTodayWords, getMonthWords, getHistory, getDailyGoal,
   setDailyGoal, getMonthlyGoal, setMonthlyGoal, type DayLog,
@@ -65,18 +66,16 @@ export function WritingGoals() {
       </div>
 
       {editingGoal && (
-        <div style={{ background: "var(--bg-white)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 20, marginBottom: 16 }}>
-          <h3 style={{ fontSize: 15, marginBottom: 12 }}>设置写作目标</h3>
-          <div style={{ display: "flex", gap: 16, alignItems: "flex-end" }}>
-            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+        <div className="form-card">
+          <h3>设置写作目标</h3>
+          <div className="toolbar-actions" style={{ alignItems: "flex-end" }}>
+            <label className="form-field">
               每日目标（字）
-              <input type="number" value={tempDaily} onChange={(e) => setTempDaily(Number(e.target.value))} min={100} step={500}
-                style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14, width: 150 }} />
+              <input type="number" value={tempDaily} onChange={(e) => setTempDaily(Number(e.target.value))} min={100} step={500} />
             </label>
-            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13 }}>
+            <label className="form-field">
               每月目标（字）
-              <input type="number" value={tempMonthly} onChange={(e) => setTempMonthly(Number(e.target.value))} min={1000} step={10000}
-                style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14, width: 150 }} />
+              <input type="number" value={tempMonthly} onChange={(e) => setTempMonthly(Number(e.target.value))} min={1000} step={10000} />
             </label>
             <button className="btn-primary" onClick={handleSaveGoals}>保存</button>
             <button className="btn-outline" onClick={() => setEditingGoal(false)}>取消</button>
@@ -84,43 +83,43 @@ export function WritingGoals() {
         </div>
       )}
       {/* Progress bars */}
-      <div className="stats-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
+      <div className="stats-row stats-row--two">
         <div className="stat-card">
           <div className="stat-label">今日进度</div>
           <div className="stat-value" style={{ fontSize: 22 }}>{todayWords} <span style={{ fontSize: 14, color: "var(--text-dim)" }}>/ {dailyGoal} 字</span></div>
-          <div style={{ background: "var(--border-light)", borderRadius: 4, height: 8, marginTop: 10 }}>
-            <div style={{ background: todayPct >= 100 ? "var(--success)" : "var(--accent)", width: `${todayPct}%`, height: "100%", borderRadius: 4, transition: "width 0.3s" }} />
+          <div className="progress-track">
+            <div className="progress-fill" style={{ background: todayPct >= 100 ? "var(--success)" : "var(--accent)", width: `${todayPct}%` }} />
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 4 }}>{todayPct}%</div>
         </div>
         <div className="stat-card">
           <div className="stat-label">本月进度</div>
           <div className="stat-value" style={{ fontSize: 22 }}>{monthWords} <span style={{ fontSize: 14, color: "var(--text-dim)" }}>/ {monthlyGoal} 字</span></div>
-          <div style={{ background: "var(--border-light)", borderRadius: 4, height: 8, marginTop: 10 }}>
-            <div style={{ background: monthPct >= 100 ? "var(--success)" : "var(--accent)", width: `${monthPct}%`, height: "100%", borderRadius: 4, transition: "width 0.3s" }} />
+          <div className="progress-track">
+            <div className="progress-fill" style={{ background: monthPct >= 100 ? "var(--success)" : "var(--accent)", width: `${monthPct}%` }} />
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 4 }}>{monthPct}%</div>
         </div>
       </div>
       {/* Stats */}
-      <div className="stats-row" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+      <div className="stats-row stats-row--four">
         <div className="stat-card">
-          <div className="stat-icon">🔥</div>
+          <div className="icon-chip"><Flame size={22} /></div>
           <div className="stat-value">{streak}</div>
           <div className="stat-label">连续天数</div>
         </div>
         <div className="stat-card">
-          <div className="stat-icon">📝</div>
+          <div className="icon-chip"><PenLine size={22} /></div>
           <div className="stat-value">{totalWords.toLocaleString()}</div>
           <div className="stat-label">总字数</div>
         </div>
         <div className="stat-card">
-          <div className="stat-icon">📊</div>
+          <div className="icon-chip"><BarChart3 size={22} /></div>
           <div className="stat-value">{avgDaily.toLocaleString()}</div>
           <div className="stat-label">日均字数</div>
         </div>
         <div className="stat-card">
-          <div className="stat-icon">🏆</div>
+          <div className="icon-chip"><Trophy size={22} /></div>
           <div className="stat-value">{bestDay.words.toLocaleString()}</div>
           <div className="stat-label">最佳单日 ({bestDay.date})</div>
         </div>

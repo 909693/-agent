@@ -182,9 +182,20 @@ fn build_constraints_text(constraints: Option<&Value>) -> String {
     }
 
     if let Some(prompts) = c["prompts"].as_array() {
-        if !prompts.is_empty() {
+        // Genre authoring guide (category "genre") gets its own section so it is
+        // always included and doesn't consume the 3-slot user-prompt budget below.
+        if let Some(g) = prompts.iter().find(|p| p["category"].as_str() == Some("genre")) {
+            let content = g["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                sections.push(format!("## 类型创作指引\n{}", truncate_chars(content, 1200)));
+            }
+        }
+        let user_prompts: Vec<&Value> = prompts.iter()
+            .filter(|p| p["category"].as_str() != Some("genre"))
+            .collect();
+        if !user_prompts.is_empty() {
             let mut text = String::from("## 必须应用的提示词\n");
-            for prompt in prompts.iter().take(3) {
+            for prompt in user_prompts.iter().take(3) {
                 let title = prompt["title"].as_str().unwrap_or("未命名提示词");
                 let category = prompt["category"].as_str().unwrap_or("未分类");
                 let content = prompt["content"].as_str().unwrap_or("");
@@ -277,7 +288,9 @@ pub fn build_rich_context_string(project_id: &str, chapter_number: u32) -> Resul
 
     // Remove resolved from active
     active_foreshadowing.retain(|f| {
-        !resolved_foreshadowing.iter().any(|r| f.contains(r))
+        // Skip empty resolved entries: `contains("")` is always true and would
+        // wipe every pending foreshadowing if the model emits an empty string.
+        !resolved_foreshadowing.iter().any(|r| !r.is_empty() && f.contains(r))
     });
 
     // Fallback: if no summaries exist, read raw chapter text for context
@@ -378,9 +391,15 @@ async fn auto_summarize_and_save(
     let summary = engine::summarize_chapter(client, chapter_number, chapter_text, &chapter_outline).await?;
 
     let summaries_file = "chapter_summaries.json";
-    let mut summaries = storage::load_json(project_id, summaries_file)?.unwrap_or(json!({}));
-    summaries[chapter_number.to_string()] = summary.clone();
-    storage::save_json(project_id, summaries_file, &summaries)?;
+    // Serialize the read-modify-write so concurrent summaries (batch + manual)
+    // don't lose each other's updates to the shared aggregate file.
+    {
+        let lock = storage::project_lock(project_id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut summaries = storage::load_json(project_id, summaries_file)?.unwrap_or(json!({}));
+        summaries[chapter_number.to_string()] = summary.clone();
+        storage::save_json(project_id, summaries_file, &summaries)?;
+    }
 
     Ok(summary)
 }
@@ -516,6 +535,126 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
     }
 }
 
+/// Extract model IDs from a provider's model-list response.
+/// Handles OpenAI/Anthropic ({"data":[{"id":..}]}), Gemini ({"models":[{"name":"models/..."}]}),
+/// and bare-array / string-array variants some proxies return.
+fn extract_model_ids(data: &Value) -> Vec<String> {
+    let empty = Vec::new();
+    let items = data["data"]
+        .as_array()
+        .or_else(|| data["models"].as_array())
+        .or_else(|| data.as_array())
+        .unwrap_or(&empty);
+    let mut ids: Vec<String> = Vec::new();
+    for item in items {
+        // Gemini lists embedding/TTS-only models too; keep only generateContent-capable
+        // ones when the capability field is present.
+        if let Some(methods) = item["supportedGenerationMethods"].as_array() {
+            let can_generate = methods
+                .iter()
+                .any(|m| m.as_str().is_some_and(|s| s.contains("generateContent")));
+            if !can_generate {
+                continue;
+            }
+        }
+        let id = item["id"]
+            .as_str()
+            .or_else(|| item["name"].as_str())
+            .or_else(|| item.as_str());
+        if let Some(id) = id {
+            let id = id.strip_prefix("models/").unwrap_or(id);
+            if !id.is_empty() {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[tauri::command]
+async fn fetch_models(
+    api_format: String,
+    api_key: String,
+    base_url: String,
+    proxy_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    // Validate base_url to prevent SSRF
+    validate_base_url(&base_url)?;
+
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(false)
+        .timeout(Duration::from_secs(30));
+    if let Some(ref proxy) = proxy_url {
+        if let Ok(p) = reqwest::Proxy::all(proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    let client = builder.build().map_err(|e| format!("Client build: {:?}", e))?;
+
+    let base = |default: &str| -> String {
+        if base_url.is_empty() {
+            default.to_string()
+        } else {
+            base_url.trim_end_matches('/').to_string()
+        }
+    };
+
+    let (status, text) = match api_format.as_str() {
+        "anthropic" => {
+            let url = format!("{}/v1/models?limit=1000", base("https://api.anthropic.com"));
+            let resp = client
+                .get(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            // 部分中转站只认 Bearer；认证类错误时换认证方式重试一次
+            if matches!(status.as_u16(), 401 | 403 | 404) {
+                let resp2 = client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("anthropic-version", "2023-06-01")
+                    .send().await.map_err(|e| format!("请求失败: {}", e))?;
+                let status2 = resp2.status();
+                let text2 = resp2.text().await.unwrap_or_default();
+                if status2.is_success() { (status2, text2) } else { (status, text) }
+            } else {
+                (status, text)
+            }
+        }
+        "gemini" => {
+            let url = format!("{}/v1beta/models?pageSize=1000", base("https://generativelanguage.googleapis.com"));
+            let resp = client
+                .get(&url)
+                .header("x-goog-api-key", &api_key)
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            (resp.status(), resp.text().await.unwrap_or_default())
+        }
+        _ => {
+            let url = format!("{}/v1/models", base("https://api.openai.com"));
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            (resp.status(), resp.text().await.unwrap_or_default())
+        }
+    };
+
+    if !status.is_success() {
+        return Err(format!("拉取模型失败 ({}): {}", status, truncate_chars(&text, 300)));
+    }
+    let data: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("响应不是有效 JSON: {}", truncate_chars(&text, 300)))?;
+    let models = extract_model_ids(&data);
+    if models.is_empty() {
+        return Err(format!("接口返回成功但未解析到模型，原始响应: {}", truncate_chars(&text, 300)));
+    }
+    Ok(models)
+}
+
 #[tauri::command]
 fn set_data_dir(new_dir: String, migrate: bool) -> Result<String, String> {
     // Validate directory path
@@ -639,10 +778,11 @@ async fn agent_chat(
     }
     // Strategy 2: extract from markdown code block
     if trimmed.contains("```") {
-        let start = trimmed.find("```").unwrap_or(0) + 3;
+        let start = trimmed.find("```").map(|i| i + 3).unwrap_or(0).min(trimmed.len());
         let after = &trimmed[start..];
-        let content_start = after.find('\n').unwrap_or(0) + 1;
-        let end = after.rfind("```").unwrap_or(after.len());
+        let len = after.len();
+        let content_start = after.find('\n').map(|i| i + 1).unwrap_or(len).min(len);
+        let end = after[content_start..].rfind("```").map(|i| content_start + i).unwrap_or(len);
         let json_str = &after[content_start..end];
         if let Ok(parsed) = serde_json::from_str::<Value>(json_str.trim()) {
             if parsed.get("reply").is_some() {
@@ -1044,14 +1184,19 @@ async fn extract_framework(
 fn parse_framework_json(text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     let json_str = if trimmed.contains("```") {
-        let start = trimmed.find("```").unwrap_or(0);
-        let after_fence = &trimmed[start + 3..];
-        let content_start = after_fence.find('\n').unwrap_or(0) + 1;
-        let end = after_fence.rfind("```").unwrap_or(after_fence.len());
+        let start = trimmed.find("```").map(|i| i + 3).unwrap_or(0).min(trimmed.len());
+        let after_fence = &trimmed[start..];
+        let len = after_fence.len();
+        let content_start = after_fence.find('\n').map(|i| i + 1).unwrap_or(len).min(len);
+        let end = after_fence[content_start..].rfind("```").map(|i| content_start + i).unwrap_or(len);
         &after_fence[content_start..end]
     } else if let Some(start) = trimmed.find('{') {
-        let end = trimmed.rfind('}').unwrap_or(trimmed.len());
-        &trimmed[start..=end]
+        let end = trimmed.rfind('}').unwrap_or(start);
+        if end >= start {
+            &trimmed[start..=end]
+        } else {
+            &trimmed[start..]
+        }
     } else {
         trimmed
     };
@@ -1372,6 +1517,9 @@ async fn generate_plot_chunked(
 
     let acts = skeleton["acts"].as_array()
         .ok_or("骨架生成失败：未返回 acts 数组")?;
+    if acts.is_empty() {
+        return Err("骨架生成失败：acts 数组为空".into());
+    }
     let total_acts_count = acts.len() as u32;
     eprintln!("[generate_plot_chunked] Phase 1 done: {} acts, target {} chapters", total_acts_count, target_chapters);
 
@@ -1643,15 +1791,20 @@ async fn expand_chapter(
         &context,
     )
     .await?;
-    // Snapshot before overwriting
+    // Snapshot before overwriting, under the project lock so a concurrent reorder
+    // or save can't interleave and lose the update.
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
-    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
-        let old_text = existing["text"].as_str().unwrap_or("");
-        if !old_text.is_empty() {
-            let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+    {
+        let lock = storage::project_lock(&project_id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+            let old_text = existing["text"].as_str().unwrap_or("");
+            if !old_text.is_empty() {
+                let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+            }
         }
+        storage::save_json(&project_id, &chapter_file, &result)?;
     }
-    storage::save_json(&project_id, &chapter_file, &result)?;
     Ok(result)
 }
 
@@ -1710,6 +1863,20 @@ async fn continue_writing(
         &context,
     )
     .await?;
+    // Persist under the project lock. Re-read first: if the chapter changed during
+    // generation (a reorder or another save), abort rather than overwrite with a
+    // continuation based on now-stale text. Snapshot so the append is recoverable.
+    let lock = storage::project_lock(&project_id);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let current = storage::load_json(&project_id, &chapter_file)?
+        .ok_or("Chapter not found")?;
+    let current_text = current["text"].as_str().unwrap_or("");
+    if current_text != existing_text {
+        return Err("章节在生成期间被修改，续写已取消，请重试".into());
+    }
+    if !existing_text.is_empty() {
+        let _ = storage::save_snapshot(&project_id, chapter_number, existing_text);
+    }
     // Append to existing chapter
     let new_text = format!("{}\n\n{}", existing_text, result["text"].as_str().unwrap_or(""));
     let updated = json!({"text": new_text});
@@ -1718,7 +1885,7 @@ async fn continue_writing(
 }
 
 #[tauri::command]
-async fn save_chapter(project_id: String, chapter_number: u32, text: String) -> Result<(), String> {
+async fn save_chapter(project_id: String, chapter_number: u32, text: String, snapshot: Option<bool>) -> Result<(), String> {
     // Input validation
     if chapter_number == 0 || chapter_number > 9999 {
         return Err("章节号必须在 1-9999 范围内".into());
@@ -1727,15 +1894,86 @@ async fn save_chapter(project_id: String, chapter_number: u32, text: String) -> 
         return Err("章节内容过长（最大 500000 字符）".into());
     }
 
-    // Auto-snapshot before overwriting
+    // Snapshot before overwriting, unless the caller opts out (auto-save does, to
+    // avoid flooding snapshots every few seconds) and only when content changed.
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
-    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
-        let old_text = existing["text"].as_str().unwrap_or("");
-        if !old_text.is_empty() {
-            let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+    // Serialize this chapter file's read-modify-write against concurrent writers
+    // (e.g. a chapter reorder / batch) so updates aren't lost. No .await while held.
+    let lock = storage::project_lock(&project_id);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if snapshot.unwrap_or(true) {
+        if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+            let old_text = existing["text"].as_str().unwrap_or("");
+            if !old_text.is_empty() && old_text != text {
+                let _ = storage::save_snapshot(&project_id, chapter_number, old_text);
+            }
         }
     }
     storage::save_json(&project_id, &chapter_file, &json!({"text": text}))
+}
+
+/// Swap two chapters' stored text and summaries. Used when the outline reorders
+/// chapters (their numbers swap) so number-keyed text/summaries follow along and
+/// don't desync from the outline entries.
+#[tauri::command]
+async fn swap_chapters(project_id: String, a: u32, b: u32) -> Result<(), String> {
+    if a == 0 || b == 0 || a > 9999 || b > 9999 {
+        return Err("章节号必须在 1-9999 范围内".into());
+    }
+    if a == b {
+        return Ok(());
+    }
+    if BATCH_RUNNING.load(Ordering::SeqCst) {
+        return Err("批量生成进行中，请先取消或等待完成后再重排章节".into());
+    }
+    // Serialize against concurrent writers to the same project's files.
+    let lock = storage::project_lock(&project_id);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let fa = format!("chapter_{:03}.json", a);
+    let fb = format!("chapter_{:03}.json", b);
+    let va = storage::load_json(&project_id, &fa)?.unwrap_or_else(|| json!({"text": ""}));
+    let vb = storage::load_json(&project_id, &fb)?.unwrap_or_else(|| json!({"text": ""}));
+    // Snapshot both chapters before the destructive overwrites so a half-completed
+    // swap (e.g. the second save fails) is recoverable. swap_snapshots below then
+    // carries these backups along with the content.
+    if let Some(t) = va["text"].as_str() { if !t.is_empty() { let _ = storage::save_snapshot(&project_id, a, t); } }
+    if let Some(t) = vb["text"].as_str() { if !t.is_empty() { let _ = storage::save_snapshot(&project_id, b, t); } }
+    storage::save_json(&project_id, &fa, &vb)?;
+    storage::save_json(&project_id, &fb, &va)?;
+
+    // Swap the matching summary entries so RAG/consistency stay aligned, fixing
+    // each moved summary's internal "chapter" field to match its new key.
+    let summaries_file = "chapter_summaries.json";
+    if let Some(mut summaries) = storage::load_json(&project_id, summaries_file)? {
+        if let Some(obj) = summaries.as_object_mut() {
+            let ka = a.to_string();
+            let kb = b.to_string();
+            let sa = obj.get(&ka).cloned();
+            let sb = obj.get(&kb).cloned();
+            match sb {
+                Some(mut v) => {
+                    if let Some(o) = v.as_object_mut() { o.insert("chapter".into(), json!(a)); }
+                    obj.insert(ka.clone(), v);
+                }
+                None => { obj.remove(&ka); }
+            }
+            match sa {
+                Some(mut v) => {
+                    if let Some(o) = v.as_object_mut() { o.insert("chapter".into(), json!(b)); }
+                    obj.insert(kb.clone(), v);
+                }
+                None => { obj.remove(&kb); }
+            }
+            storage::save_json(&project_id, summaries_file, &summaries)?;
+        }
+    }
+
+    // Snapshots are also keyed by chapter number — swap them so each chapter's
+    // version history follows the reorder (otherwise "restore" would overwrite
+    // the moved content with another chapter's old text).
+    storage::swap_snapshots(&project_id, a, b)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1880,7 +2118,9 @@ async fn build_chapter_context(
 
     // Remove resolved from active
     active_foreshadowing.retain(|f| {
-        !resolved_foreshadowing.iter().any(|r| f.contains(r))
+        // Skip empty resolved entries: `contains("")` is always true and would
+        // wipe every pending foreshadowing if the model emits an empty string.
+        !resolved_foreshadowing.iter().any(|r| !r.is_empty() && f.contains(r))
     });
 
     // Get last chapter's end_state for continuity
@@ -2061,19 +2301,20 @@ async fn batch_generate_chapters(
         return Err("批量生成已在运行中".into());
     }
 
-    // RAII guard to ensure BATCH_RUNNING is reset on early return
+    // RAII guard resets BATCH_RUNNING exactly once when the worker task ends —
+    // on normal completion OR panic (the guard is moved into the task below).
     struct ResetGuard;
     impl Drop for ResetGuard {
         fn drop(&mut self) {
             BATCH_RUNNING.store(false, Ordering::SeqCst);
         }
     }
-    let _guard = ResetGuard;
 
     BATCH_CANCEL.store(false, Ordering::SeqCst);
 
     let constraints_clone = constraints.clone();
     let handle = tokio::spawn(async move {
+        let _reset = ResetGuard;
         let start_time = std::time::Instant::now();
         let total = end_chapter - start_chapter + 1;
         let mut completed = 0u32;
@@ -2161,7 +2402,21 @@ async fn batch_generate_chapters(
             match result {
                 Ok(chapter_data) => {
                     let chapter_file = format!("chapter_{:03}.json", chapter_number);
-                    if let Err(e) = storage::save_json(&project_id, &chapter_file, &chapter_data) {
+                    // Snapshot + save under the project lock so a concurrent reorder
+                    // or autosave can't interleave; released before summarizing.
+                    let save_result = {
+                        let lock = storage::project_lock(&project_id);
+                        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+                            if let Some(old) = existing["text"].as_str() {
+                                if !old.is_empty() {
+                                    let _ = storage::save_snapshot(&project_id, chapter_number, old);
+                                }
+                            }
+                        }
+                        storage::save_json(&project_id, &chapter_file, &chapter_data)
+                    };
+                    if let Err(e) = save_result {
                         failed += 1;
                         failed_chapters.push(chapter_number);
                         let _ = app.emit("batch_progress", BatchProgress {
@@ -2213,18 +2468,13 @@ async fn batch_generate_chapters(
             elapsed_seconds: elapsed,
             failed_chapters,
         });
-        BATCH_RUNNING.store(false, Ordering::SeqCst);
     });
 
-    // Forget guard - task will reset BATCH_RUNNING on completion
-    std::mem::forget(_guard);
-
-    // Spawn a watcher to ensure BATCH_RUNNING is reset even if the task panics
+    // Watcher only logs a panic; the ResetGuard inside the task already resets
+    // BATCH_RUNNING exactly once (on completion or panic), so resetting here too
+    // could clear a *newer* batch's flag if one started in between.
     tokio::spawn(async move {
-        let result = handle.await;
-        // Always reset BATCH_RUNNING, whether task succeeded or panicked
-        BATCH_RUNNING.store(false, Ordering::SeqCst);
-        if let Err(e) = result {
+        if let Err(e) = handle.await {
             eprintln!("Batch generation task panicked: {:?}", e);
         }
     });
@@ -2285,6 +2535,9 @@ async fn restore_snapshot(project_id: String, chapter_number: u32, snapshot_file
 
     // Backup current before restoring
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
+    // Serialize the chapter file's read-modify-write (no .await while held).
+    let lock = storage::project_lock(&project_id);
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
         let old_text = existing["text"].as_str().unwrap_or("");
         if !old_text.is_empty() {
@@ -2319,7 +2572,7 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
     let search_timeout = std::time::Duration::from_secs(10);
 
     // Scan all chapter files
-    for num in 1..=999u32 {
+    for num in 1..=9999u32 {
         if total_matches >= 100 { break; }
         if search_start.elapsed() > search_timeout {
             break; // Graceful timeout instead of error
@@ -2328,25 +2581,28 @@ async fn search_chapters(project_id: String, query: String) -> Result<Value, Str
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
             if let Some(text) = ch["text"].as_str() {
                 let text_lower = text.to_lowercase();
+                // Index entirely within `text_lower`: `to_lowercase()` can change
+                // byte/char lengths (e.g. 'İ', 'K'→'k', 'ß'), so a byte offset from
+                // text_lower must never index the original `text` (panic / mismatch).
+                // The preview is lowercased as a result — acceptable for a snippet.
                 let mut matches: Vec<Value> = Vec::new();
                 let mut start = 0;
                 while let Some(pos) = text_lower[start..].find(&query_lower) {
                     let abs_pos = start + pos;
-                    // Use char-based context window (~30 chars each side)
-                    let char_pos = text[..abs_pos].chars().count();
-                    let total_chars = text.chars().count();
+                    let char_pos = text_lower[..abs_pos].chars().count();
+                    let total_chars = text_lower.chars().count();
                     let ctx_char_start = char_pos.saturating_sub(30);
-                    let query_char_len = query.chars().count();
+                    let query_char_len = query_lower.chars().count();
                     let ctx_char_end = (char_pos + query_char_len + 30).min(total_chars);
-                    let cs = text.char_indices().nth(ctx_char_start).map(|(i, _)| i).unwrap_or(0);
-                    let ce = text.char_indices().nth(ctx_char_end).map(|(i, _)| i).unwrap_or(text.len());
+                    let cs = text_lower.char_indices().nth(ctx_char_start).map(|(i, _)| i).unwrap_or(0);
+                    let ce = text_lower.char_indices().nth(ctx_char_end).map(|(i, _)| i).unwrap_or(text_lower.len());
                     matches.push(json!({
                         "offset": abs_pos,
-                        "context": &text[cs..ce],
+                        "context": &text_lower[cs..ce],
                     }));
                     total_matches += 1;
                     if total_matches >= 100 { break; }
-                    start = abs_pos + query.len();
+                    start = abs_pos + query_lower.len();
                 }
                 if !matches.is_empty() {
                     // Find chapter title from plot
@@ -2403,7 +2659,7 @@ async fn analyze_writing_style(
 ) -> Result<Value, String> {
     // Collect up to 5 written chapters as samples
     let mut samples = Vec::new();
-    for num in 1..=999u32 {
+    for num in 1..=9999u32 {
         if samples.len() >= 5 { break; }
         let file = format!("chapter_{:03}.json", num);
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
@@ -2511,11 +2767,22 @@ async fn deep_sensitivity_check(
     engine::sensitivity_check(&client, &truncate_chars(&chapter_text, 8000)).await
 }
 
+fn sanitize_filename(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 #[tauri::command]
-async fn export_novel(project_id: String, format: String) -> Result<String, String> {
+async fn export_novel(project_id: String, format: String, mode: Option<String>) -> Result<Value, String> {
     use std::io::Write as _;
 
-    log_export_project(&project_id, &format);
+    let per_chapter = mode.as_deref() == Some("chapters");
+    log_export_project(&project_id, &format!("{}/{}", format, if per_chapter { "chapters" } else { "single" }));
 
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let title = meta["title"].as_str().unwrap_or("novel");
@@ -2541,18 +2808,108 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
         }
     }
     if chapter_nums.is_empty() {
-        // Scan for existing chapter files
-        for num in 1..=999u32 {
+        // Scan for existing chapter files. Do NOT break on the first gap — a
+        // missing chapter number in the middle must not truncate the export.
+        for num in 1..=9999u32 {
             let file = format!("chapter_{:03}.json", num);
             if storage::load_json(&project_id, &file).ok().flatten().is_some() {
                 chapter_nums.push(num);
-            } else {
-                break;
             }
         }
     }
 
-    // Estimate total size to prevent OOM
+    let chapter_title_of = |num: u32| -> String {
+        plot.as_ref()
+            .and_then(|p| p["acts"].as_array())
+            .and_then(|acts| {
+                acts.iter().find_map(|act| {
+                    act["chapters"].as_array().and_then(|chs| {
+                        chs.iter().find_map(|c| {
+                            if c["number"].as_u64() == Some(num as u64) {
+                                c["title"].as_str().map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    let export_dir = storage::project_dir(&project_id).join("exports");
+    std::fs::create_dir_all(&export_dir).map_err(|e: std::io::Error| e.to_string())?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let safe_title = sanitize_filename(title, 100);
+    let safe_title = if safe_title.is_empty() { "novel".to_string() } else { safe_title };
+
+    let is_md = format == "md";
+    let is_html = format == "html";
+
+    // Per-chapter mode: one file per chapter inside a timestamped directory
+    if per_chapter {
+        let out_dir = export_dir.join(format!("{}_{}_分章", safe_title, timestamp));
+        std::fs::create_dir_all(&out_dir).map_err(|e| format!("无法创建导出目录: {}", e))?;
+        let mut count = 0usize;
+
+        for num in &chapter_nums {
+            let file = format!("chapter_{:03}.json", num);
+            let Some(ch) = storage::load_json(&project_id, &file).ok().flatten() else { continue };
+            let Some(text) = ch["text"].as_str() else { continue };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let ch_title = chapter_title_of(*num);
+            let safe_ch = sanitize_filename(&ch_title, 60);
+            let filename = if safe_ch.is_empty() {
+                format!("第{:03}章.{}", num, format)
+            } else {
+                format!("第{:03}章_{}.{}", num, safe_ch, format)
+            };
+            let heading = if ch_title.is_empty() {
+                format!("第{}章", num)
+            } else {
+                format!("第{}章 {}", num, ch_title)
+            };
+
+            let f = std::fs::File::create(out_dir.join(&filename))
+                .map_err(|e| format!("无法创建导出文件 {}: {}", filename, e))?;
+            let mut w = std::io::BufWriter::new(f);
+            if is_html {
+                let head = format!(
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{t}</title><style>body{{max-width:800px;margin:40px auto;padding:0 20px;font-family:serif;line-height:1.8;color:#333}}h1{{text-align:center;margin-bottom:40px}}p{{text-indent:2em;margin:0.5em 0}}</style></head><body><h1>{t}</h1>\n",
+                    t = html_escape(&heading)
+                );
+                w.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+                for para in text.split('\n') {
+                    let p = para.trim();
+                    if !p.is_empty() {
+                        let line = format!("<p>{}</p>\n", html_escape(p));
+                        w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+                    }
+                }
+                w.write_all(b"</body></html>").map_err(|e| e.to_string())?;
+            } else if is_md {
+                w.write_all(format!("# {}\n\n", heading).as_bytes()).map_err(|e| e.to_string())?;
+                w.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+                w.write_all(b"\n").map_err(|e| e.to_string())?;
+            } else {
+                w.write_all(format!("{}\n\n", heading).as_bytes()).map_err(|e| e.to_string())?;
+                w.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+                w.write_all(b"\n").map_err(|e| e.to_string())?;
+            }
+            w.flush().map_err(|e| format!("写入 {} 失败: {}", filename, e))?;
+            count += 1;
+        }
+
+        if count == 0 {
+            let _ = std::fs::remove_dir(&out_dir);
+            return Err("没有可导出的章节内容".into());
+        }
+        return Ok(json!({ "path": out_dir.to_string_lossy(), "count": count }));
+    }
+
+    // Single-file mode: estimate total size to prevent OOM
     let mut estimated_size = 0usize;
     for num in &chapter_nums {
         let file = format!("chapter_{:03}.json", num);
@@ -2565,30 +2922,15 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
 
     // Limit to 50MB
     if estimated_size > 50_000_000 {
-        return Err("小说内容过大（超过 50MB），请分段导出".into());
+        return Err("小说内容过大（超过 50MB），请使用按章导出".into());
     }
 
-    // Create export file
-    let export_dir = storage::project_dir(&project_id).join("exports");
-    std::fs::create_dir_all(&export_dir).map_err(|e: std::io::Error| e.to_string())?;
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    // Sanitize title for use in filename
-    let safe_title: String = title.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
-        .collect::<String>()
-        .trim()
-        .chars().take(100)
-        .collect();
-    let safe_title = if safe_title.is_empty() { "novel".to_string() } else { safe_title };
     let filename = format!("{}_{}.{}", safe_title, timestamp, format);
     let export_path = export_dir.join(&filename);
 
     let file = std::fs::File::create(&export_path)
         .map_err(|e| format!("无法创建导出文件: {}", e))?;
     let mut writer = std::io::BufWriter::new(file);
-
-    let is_md = format == "md";
-    let is_html = format == "html";
 
     // Write header
     if is_html {
@@ -2604,28 +2946,12 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
     }
 
     // Write chapters incrementally
+    let mut count = 0usize;
     for num in chapter_nums {
         let file = format!("chapter_{:03}.json", num);
         if let Ok(Some(ch)) = storage::load_json(&project_id, &file) {
             if let Some(text) = ch["text"].as_str() {
-                let ch_title = plot
-                    .as_ref()
-                    .and_then(|p| {
-                        p["acts"].as_array().and_then(|acts| {
-                            acts.iter().find_map(|act| {
-                                act["chapters"].as_array().and_then(|chs| {
-                                    chs.iter().find_map(|c| {
-                                        if c["number"].as_u64() == Some(num as u64) {
-                                            c["title"].as_str().map(|s| s.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                })
-                            })
-                        })
-                    })
-                    .unwrap_or_default();
+                let ch_title = chapter_title_of(num);
 
                 if is_html {
                     let heading = if !ch_title.is_empty() {
@@ -2660,6 +2986,7 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
                     writer.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
                     writer.write_all(b"\n\n").map_err(|e| e.to_string())?;
                 }
+                count += 1;
             }
         }
     }
@@ -2670,7 +2997,11 @@ async fn export_novel(project_id: String, format: String) -> Result<String, Stri
     }
 
     writer.flush().map_err(|e| format!("刷新缓冲区失败: {}", e))?;
-    Ok(export_path.to_string_lossy().to_string())
+    if count == 0 {
+        let _ = std::fs::remove_file(&export_path);
+        return Err("没有可导出的章节内容".into());
+    }
+    Ok(json!({ "path": export_path.to_string_lossy(), "count": count }))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2683,6 +3014,7 @@ pub fn run() {
             get_data_dir,
             set_data_dir,
             test_llm,
+            fetch_models,
             save_llm_config,
             get_llm_config,
             save_llm_profiles,
@@ -2712,6 +3044,7 @@ pub fn run() {
             expand_chapter,
             continue_writing,
             save_chapter,
+            swap_chapters,
             get_chapter,
             rewrite_selection,
             review_chapter,

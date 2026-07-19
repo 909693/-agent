@@ -91,20 +91,34 @@ async fn parse_resp(resp: Response) -> Result<(bool, Value), String> {
 
     // Use streaming to read response body chunk by chunk
     // This keeps the connection alive and avoids intermediate proxy timeouts
+    const MAX_RESP_BYTES: usize = 64 * 1024 * 1024; // 64MB hard cap to avoid OOM
     let mut body_bytes = Vec::new();
     let mut stream = resp.bytes_stream();
+    let mut stream_broken = false;
     while let Some(chunk) = stream.next().await {
         match chunk {
-            Ok(bytes) => body_bytes.extend_from_slice(&bytes),
-            Err(e) => {
-                // If we already have some data, try to use it
-                if !body_bytes.is_empty() {
-                    break;
+            Ok(bytes) => {
+                body_bytes.extend_from_slice(&bytes);
+                if body_bytes.len() > MAX_RESP_BYTES {
+                    return Err(format!(
+                        "响应体过大（超过 {}MB），已中止",
+                        MAX_RESP_BYTES / 1024 / 1024
+                    ));
                 }
-                return Err(format!(
-                    "读取响应失败: {}\n请求URL: {}\nHTTP状态: {}",
-                    e, url, status
-                ));
+            }
+            Err(e) => {
+                // Genuine mid-body network failure. If nothing arrived yet, fail
+                // outright. If partial data arrived, keep it only when the stream
+                // already reached a completion marker (checked below) — otherwise
+                // a truncated chapter would be persisted as if it were complete.
+                if body_bytes.is_empty() {
+                    return Err(format!(
+                        "读取响应失败: {}\n请求URL: {}\nHTTP状态: {}",
+                        e, redact_url_secrets(&url), status
+                    ));
+                }
+                stream_broken = true;
+                break;
             }
         }
     }
@@ -121,17 +135,22 @@ async fn parse_resp(resp: Response) -> Result<(bool, Value), String> {
         if let Ok(data) = serde_json::from_str::<Value>(&text) {
             return Ok((false, data));
         }
-        // Return raw text for debugging if not JSON
-        let preview = if text.len() > 200 {
-            format!("{}...", &text[..200])
-        } else {
-            text.clone()
-        };
+        // Return raw text for debugging if not JSON (UTF-8 safe truncation)
+        let preview = truncate_chars_for_preview(&text, 200);
         return Err(format!("API 错误 ({}): {}", status, preview));
     }
 
     if text.trim().is_empty() {
-        return Err(format!("API 返回空响应 (URL: {})", url));
+        return Err(format!("API 返回空响应 (URL: {})", redact_url_secrets(&url)));
+    }
+
+    // A broken stream is only acceptable if it already reached a completion
+    // marker; otherwise reject rather than assemble a silently-truncated body.
+    if stream_broken && !sse_stream_looks_complete(&text) {
+        return Err(format!(
+            "响应在传输中被截断（未收到结束标记），已丢弃不完整内容。URL: {}",
+            redact_url_secrets(&url)
+        ));
     }
 
     // Try direct JSON parse first
@@ -150,7 +169,7 @@ async fn parse_resp(resp: Response) -> Result<(bool, Value), String> {
     let preview = truncate_chars_for_preview(&text, 300);
     Err(format!(
         "API 响应格式无法解析\nURL: {}\n响应预览: {}",
-        url, preview
+        redact_url_secrets(&url), preview
     ))
 }
 
@@ -162,6 +181,7 @@ fn parse_sse_to_openai_response(sse_text: &str) -> Result<(bool, Value), String>
     let mut thinking_text = String::new();
     let mut model = String::new();
     let mut id = String::new();
+    let mut stop_reason = String::new();
     let mut event_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut delta_type_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut last_error: Option<String> = None;
@@ -243,6 +263,11 @@ fn parse_sse_to_openai_response(sse_text: &str) -> Result<(bool, Value), String>
             "error" => {
                 last_error = Some(chunk["error"].to_string());
             }
+            "message_delta" => {
+                if let Some(sr) = chunk["delta"]["stop_reason"].as_str() {
+                    stop_reason = sr.to_string();
+                }
+            }
             _ => {}
         }
 
@@ -253,6 +278,11 @@ fn parse_sse_to_openai_response(sse_text: &str) -> Result<(bool, Value), String>
         // Some OpenAI-compat gateways put content in reasoning_content
         if let Some(reasoning) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
             thinking_text.push_str(reasoning);
+        }
+        if stop_reason.is_empty() {
+            if let Some(fr) = chunk["choices"][0]["finish_reason"].as_str() {
+                stop_reason = if fr == "length" { "max_tokens".to_string() } else { fr.to_string() };
+            }
         }
     }
 
@@ -282,7 +312,7 @@ fn parse_sse_to_openai_response(sse_text: &str) -> Result<(bool, Value), String>
         ));
     };
 
-    let assembled = serde_json::json!({
+    let mut assembled = serde_json::json!({
         "id": if id.is_empty() { "sse-assembled" } else { &id },
         "type": "message",
         "model": if model.is_empty() { "unknown" } else { &model },
@@ -291,6 +321,9 @@ fn parse_sse_to_openai_response(sse_text: &str) -> Result<(bool, Value), String>
             "text": final_content
         }]
     });
+    if !stop_reason.is_empty() {
+        assembled["stop_reason"] = Value::String(stop_reason);
+    }
 
     Ok((true, assembled))
 }
@@ -386,7 +419,22 @@ impl LlmClient {
         let mut builder = Client::builder()
             .danger_accept_invalid_certs(accept_invalid)
             .timeout(Duration::from_secs(600))
-            .connect_timeout(Duration::from_secs(30));
+            .connect_timeout(Duration::from_secs(30))
+            // Do not follow cross-host redirects: reqwest does not strip custom
+            // auth headers (x-api-key / x-goog-api-key) on redirect, so following
+            // one to another origin would leak the API key.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 10 {
+                    return attempt.error("too many redirects");
+                }
+                let same_host = attempt
+                    .previous()
+                    .last()
+                    .and_then(|p| p.host_str())
+                    .map(|prev| attempt.url().host_str() == Some(prev))
+                    .unwrap_or(true);
+                if same_host { attempt.follow() } else { attempt.stop() }
+            }));
 
         if let Some(ref proxy_url) = proxy_source {
             if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
@@ -623,6 +671,57 @@ impl LlmClient {
             .ok_or_else(|| format!("Gemini error: {}", data))
     }
 
+    /// POST a JSON body with retry (connection errors + retryable statuses), then
+    /// parse. Used by the non-streaming generation paths so a transient 429/5xx
+    /// during batch generation retries instead of killing the chapter.
+    async fn post_json_retry<B: Serialize>(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &B,
+    ) -> Result<(bool, Value), String> {
+        let max_attempts = 4u32;
+        let mut last_error = String::new();
+        for attempt in 0..max_attempts {
+            let mut req = self.http.post(url);
+            for (k, v) in headers {
+                req = req.header(*k, v.as_str());
+            }
+            match req.json(body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let code = status.as_u16();
+                        if should_retry(code) && attempt + 1 < max_attempts {
+                            let delay = retry_delay(code, resp.headers(), attempt);
+                            last_error = format!("HTTP {}", code);
+                            eprintln!("[LlmClient] HTTP {} (attempt {}), {}ms 后重试", code, attempt + 1, delay.as_millis());
+                            sleep(delay).await;
+                            continue;
+                        }
+                    }
+                    return parse_resp(resp).await;
+                }
+                Err(e) => {
+                    if is_connection_error(&e) && attempt + 1 < max_attempts {
+                        let delay = exponential_backoff(attempt);
+                        last_error = e.to_string();
+                        eprintln!("[LlmClient] 连接错误 (attempt {}), {}ms 后重试: {}", attempt + 1, delay.as_millis(), e);
+                        sleep(delay).await;
+                        continue;
+                    }
+                    return Err(format!(
+                        "请求失败 ({}): {:?}\n[DEBUG] proxy_url={:?}, base_url={}, model={}",
+                        redact_url_secrets(url), e,
+                        self.config.proxy_url.as_deref().map(redact_url_secrets),
+                        self.config.base_url, self.config.model
+                    ));
+                }
+            }
+        }
+        Err(format!("重试耗尽: {}", last_error))
+    }
+
     async fn call_claude(
         &self,
         system_prompt: &str,
@@ -644,26 +743,16 @@ impl LlmClient {
         });
         let url = self.claude_url();
 
-        let resp = self
-            .http
-            .post(&url)
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                format!(
-                    "Anthropic request failed ({}): {:?}\n[DEBUG] proxy_url={:?}, base_url={}, model={}",
-                    url, e, self.config.proxy_url, self.config.base_url, self.config.model
-                )
-            })?;
-
-        eprintln!("[LlmClient] Response status: {}", resp.status());
-        let (ok, data) = parse_resp(resp).await?;
+        let (ok, data) = self.post_json_retry(&url, &[
+            ("x-api-key", self.config.api_key.clone()),
+            ("anthropic-version", "2023-06-01".to_string()),
+            ("content-type", "application/json".to_string()),
+        ], &body).await?;
         if !ok {
             return Err(format!("Anthropic API error: {}", data));
+        }
+        if data["stop_reason"].as_str() == Some("max_tokens") {
+            eprintln!("[LlmClient] Warning: JSON 响应因 max_tokens 截断，repair 可能丢数据");
         }
         let text = extract_claude_text(&data)?;
         parse_json_from_text(&text)
@@ -697,22 +786,9 @@ impl LlmClient {
         eprintln!("[LlmClient] Model: {}, max_tokens: {}, prompt_size: {} bytes",
                   self.config.model, max_tokens, prompt_len);
 
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                format!(
-                    "OpenAI request failed ({}): {:?}\n[DEBUG] proxy_url={:?}, base_url={}, model={}",
-                    url, e, self.config.proxy_url, self.config.base_url, self.config.model
-                )
-            })?;
-
-        eprintln!("[LlmClient] Response status: {}", resp.status());
-        let (ok, data) = parse_resp(resp).await?;
+        let (ok, data) = self.post_json_retry(&url, &[
+            ("Authorization", format!("Bearer {}", self.config.api_key)),
+        ], &body).await?;
         if !ok {
             return Err(format!("OpenAI API error: {}", data));
         }
@@ -724,6 +800,9 @@ impl LlmClient {
         } else {
             return Err(format!("No text in OpenAI response: {}", data));
         };
+        if data["stop_reason"].as_str() == Some("max_tokens") {
+            eprintln!("[LlmClient] Warning: JSON 响应因 max_tokens 截断，repair 可能丢数据");
+        }
         parse_json_from_text(&text)
     }
 
@@ -756,17 +835,9 @@ impl LlmClient {
         eprintln!("[LlmClient] Calling Gemini API: {}", url);
         eprintln!("[LlmClient] Model: {}, max_tokens: {}", self.config.model, max_tokens);
 
-        let resp = self
-            .http
-            .post(&url)
-            .header("x-goog-api-key", &self.config.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        eprintln!("[LlmClient] Response status: {}", resp.status());
-        let (ok, data) = parse_resp(resp).await?;
+        let (ok, data) = self.post_json_retry(&url, &[
+            ("x-goog-api-key", self.config.api_key.clone()),
+        ], &body).await?;
         if !ok {
             return Err(format!("Gemini API error: {}", data));
         }
@@ -885,16 +956,39 @@ impl LlmClient {
     }
 
     fn build_gemini_contents(msgs: &[AgentMsg]) -> Vec<Value> {
-        let mut result = Vec::new();
+        // Map tool_use_id -> function name so each tool result carries the correct
+        // functionResponse.name (Gemini matches results to calls by name, not id).
+        let mut id_to_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for msg in msgs {
+            if let AgentMsg::Assistant { tool_uses, .. } = msg {
+                for tu in tool_uses {
+                    id_to_name.insert(tu.id.clone(), tu.name.clone());
+                }
+            }
+        }
+
+        // Flush accumulated tool results as a single user turn (Gemini expects all
+        // functionResponse parts for one model turn grouped into one content).
+        fn flush(result: &mut Vec<Value>, pending: &mut Vec<Value>) {
+            if !pending.is_empty() {
+                result.push(serde_json::json!({"role": "user", "parts": pending.clone()}));
+                pending.clear();
+            }
+        }
+
+        let mut result: Vec<Value> = Vec::new();
+        let mut pending_responses: Vec<Value> = Vec::new();
         for msg in msgs {
             match msg {
                 AgentMsg::User { content } => {
+                    flush(&mut result, &mut pending_responses);
                     result.push(serde_json::json!({
                         "role": "user",
                         "parts": [{"text": content}]
                     }));
                 }
                 AgentMsg::Assistant { text, tool_uses } => {
+                    flush(&mut result, &mut pending_responses);
                     let mut parts: Vec<Value> = Vec::new();
                     if !text.is_empty() {
                         parts.push(serde_json::json!({"text": text}));
@@ -909,15 +1003,16 @@ impl LlmClient {
                     }
                     result.push(serde_json::json!({"role": "model", "parts": parts}));
                 }
-                AgentMsg::ToolResultMsg { tool_use_id: _, content } => {
+                AgentMsg::ToolResultMsg { tool_use_id, content } => {
                     let parsed: Value = serde_json::from_str(content).unwrap_or(serde_json::json!({"result": content}));
-                    result.push(serde_json::json!({
-                        "role": "user",
-                        "parts": [{"functionResponse": {"name": "tool", "response": parsed}}]
+                    let name = id_to_name.get(tool_use_id).cloned().unwrap_or_else(|| "tool".to_string());
+                    pending_responses.push(serde_json::json!({
+                        "functionResponse": {"name": name, "response": parsed}
                     }));
                 }
             }
         }
+        flush(&mut result, &mut pending_responses);
         result
     }
 
@@ -1024,18 +1119,24 @@ impl LlmClient {
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
         let mut current_tool_json = String::new();
-        let mut line_buf = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         let mut stop_reason: Option<String> = None;
 
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
+            byte_buf.extend_from_slice(&bytes);
+            if byte_buf.len() > 64 * 1024 * 1024 {
+                return Err("流响应过大（超过 64MB），已中止".to_string());
+            }
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
+            // Split on '\n' at the byte level (a newline byte never occurs inside
+            // a UTF-8 multi-byte sequence), so multi-byte chars are never cut
+            // across chunks and each complete line decodes losslessly.
+            while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=newline_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
 
                 if line.is_empty() || line == "data: [DONE]" || line.starts_with("event:") || line.starts_with(':') {
                     continue;
@@ -1184,18 +1285,23 @@ impl LlmClient {
     ) -> Result<AgentResponse, String> {
         let mut full_text = String::new();
         let mut tool_calls: std::collections::HashMap<u32, (String, String, String)> = std::collections::HashMap::new();
-        let mut line_buf = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         let mut stop_reason: Option<String> = None;
 
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
+            byte_buf.extend_from_slice(&bytes);
+            if byte_buf.len() > 64 * 1024 * 1024 {
+                return Err("流响应过大（超过 64MB），已中止".to_string());
+            }
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
+            // Split on '\n' at the byte level so multi-byte chars are never cut
+            // across chunks; decode each complete line losslessly.
+            while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=newline_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
 
                 if line.is_empty() || line == "data: [DONE]" { continue; }
                 let json_str = if let Some(pos) = line.find("data:") {
@@ -1241,7 +1347,11 @@ impl LlmClient {
             }
         }
 
-        let tool_uses: Vec<ToolUseBlock> = tool_calls.into_values().map(|(id, name, args)| {
+        // Emit tool calls in the provider's index order — HashMap iteration is
+        // nondeterministic, which would randomize write-tool execution order.
+        let mut ordered: Vec<(u32, (String, String, String))> = tool_calls.into_iter().collect();
+        ordered.sort_by_key(|(idx, _)| *idx);
+        let tool_uses: Vec<ToolUseBlock> = ordered.into_iter().map(|(_, (id, name, args))| {
             let input: Value = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
             ToolUseBlock { id, name, input }
         }).collect();
@@ -1264,7 +1374,9 @@ impl LlmClient {
         } else {
             self.config.base_url.trim_end_matches('/').to_string()
         };
-        let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}", base, self.config.model, self.config.api_key);
+        // API key goes in the x-goog-api-key header, never in the URL (URLs leak
+        // into error messages and stderr logs).
+        let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, self.config.model);
         let mut last_error = String::new();
         let mut drop_tools = false;
         let max_attempts = 4u32;
@@ -1285,6 +1397,7 @@ impl LlmClient {
 
             let resp = match self.http.post(&url)
                 .header("content-type", "application/json")
+                .header("x-goog-api-key", &self.config.api_key)
                 .json(&body)
                 .send().await
             {
@@ -1334,18 +1447,23 @@ impl LlmClient {
     ) -> Result<AgentResponse, String> {
         let mut full_text = String::new();
         let mut tool_uses: Vec<ToolUseBlock> = Vec::new();
-        let mut line_buf = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         let mut stop_reason: Option<String> = None;
 
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
+            byte_buf.extend_from_slice(&bytes);
+            if byte_buf.len() > 64 * 1024 * 1024 {
+                return Err("流响应过大（超过 64MB），已中止".to_string());
+            }
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
+            // Split on '\n' at the byte level so multi-byte chars are never cut
+            // across chunks; decode each complete line losslessly.
+            while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=newline_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
 
                 if line.is_empty() || line.starts_with("event:") { continue; }
                 let json_str = if let Some(pos) = line.find("data:") {
@@ -1424,12 +1542,15 @@ fn parse_json_from_text(text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     // Strip markdown code fences if present
     let json_str = if trimmed.starts_with("```") {
-        let start = trimmed.find('\n').unwrap_or(3) + 1;
-        let end = trimmed.rfind("```").unwrap_or(trimmed.len());
+        let len = trimmed.len();
+        // Content starts after the first newline (skip the ```lang marker line);
+        // clamp to len so a fence with no newline (e.g. just "```") can't overflow.
+        let start = trimmed.find('\n').map(|i| i + 1).unwrap_or(len).min(len);
+        // Closing fence, searched only within the content after the opening fence.
+        let end = trimmed[start..].rfind("```").map(|i| start + i).unwrap_or(len);
         if end > start {
             &trimmed[start..end]
         } else {
-            // Malformed fences, try stripping just the opening
             &trimmed[start..]
         }
     } else {
@@ -1632,6 +1753,42 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
             repaired.len(), e
         )
     })
+}
+
+/// Redact secrets that may appear in a URL before logging or surfacing to the UI:
+/// the `key=` query parameter value (Gemini) and any `user:pass@` userinfo.
+fn redact_url_secrets(url: &str) -> String {
+    let mut out = url.to_string();
+    // Redact key=... query value
+    if let Some(pos) = out.find("key=") {
+        let start = pos + 4;
+        let end = out[start..].find('&').map(|i| start + i).unwrap_or(out.len());
+        out.replace_range(start..end, "***");
+    }
+    // Redact userinfo credentials in scheme://user:pass@host
+    if let Some(scheme_pos) = out.find("://") {
+        let after = scheme_pos + 3;
+        let path_at = out[after..].find('/').map(|i| after + i).unwrap_or(out.len());
+        if let Some(at_rel) = out[after..path_at].find('@') {
+            let at = after + at_rel;
+            out.replace_range(after..at, "***");
+        }
+    }
+    out
+}
+
+/// Heuristic: does an SSE/text body already contain a stream-completion marker?
+/// Used to decide whether a mid-stream network error truncated the response.
+fn sse_stream_looks_complete(text: &str) -> bool {
+    if !text.contains("data:") {
+        // Not an SSE stream — downstream JSON parsing validates completeness.
+        return true;
+    }
+    text.contains("message_stop")
+        || text.contains("[DONE]")
+        || text.contains("\"stop_reason\"")
+        || text.contains("\"finish_reason\"")
+        || text.contains("\"finishReason\"")
 }
 
 /// Truncate string to at most `max_chars` characters, respecting UTF-8 boundaries.

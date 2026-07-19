@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface Genre {
   id: string;
@@ -77,10 +77,20 @@ const GENRES_VERSION = "v2"; // bump to force refresh
 
 function loadGenres(): Genre[] {
   try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    const storedList: Genre[] = stored ? JSON.parse(stored) : [];
     const ver = localStorage.getItem(STORAGE_KEY + "_ver");
     if (ver === GENRES_VERSION) {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) return JSON.parse(stored);
+      if (stored) return storedList;
+    } else if (Array.isArray(storedList) && storedList.length > 0) {
+      // Version bump: MERGE defaults with the user's own genres instead of
+      // overwriting — otherwise every user-created genre is wiped.
+      const defaultIds = new Set(DEFAULT_GENRES.map((g) => g.id));
+      const userGenres = storedList.filter((g) => g && !defaultIds.has(g.id));
+      const merged = [...DEFAULT_GENRES, ...userGenres];
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      localStorage.setItem(STORAGE_KEY + "_ver", GENRES_VERSION);
+      return merged;
     }
   } catch { /* ignore */ }
   localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_GENRES));
@@ -92,11 +102,45 @@ function saveGenres(genres: Genre[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(genres));
 }
 
+// Built-in genre keys (used by CreateProjectDialog / ChatCreator) → a substring
+// of the matching genre name, so a project's `genre` resolves to a genre guide.
+const GENRE_KEY_ALIASES: Record<string, string> = {
+  fantasy: "玄幻", scifi: "科幻", urban: "都市", romance: "言情",
+  mystery: "悬疑", history: "历史", horror: "恐怖",
+};
+
+/** Resolve a project's `genre` (a built-in key like "fantasy", or a custom
+ *  genre's id/name) to its authoring guide (promptHint); "" if none matches. */
+export function getGenrePromptHint(genre: string): string {
+  if (!genre) return "";
+  const genres = loadGenres();
+  const alias = GENRE_KEY_ALIASES[genre] || genre;
+  const match = genres.find((g) =>
+    g.id === genre || g.name === genre || g.name.includes(alias) || alias.includes(g.name)
+  );
+  return match?.promptHint?.trim() || "";
+}
+
 export function GenreManager() {
   const [genres, setGenres] = useState<Genre[]>(loadGenres);
   const [editing, setEditing] = useState<Genre | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: "", description: "", promptHint: "" });
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const formRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (showForm) formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [showForm, editing]);
+
+  const toggleExpand = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
   const handleSave = () => {
     if (!form.name.trim()) return;
     let updated: Genre[];
@@ -112,8 +156,9 @@ export function GenreManager() {
     setForm({ name: "", description: "", promptHint: "" });
   };
 
-  const handleDelete = (id: string) => {
-    const updated = genres.filter((g) => g.id !== id);
+  const handleDelete = (g: Genre) => {
+    if (!window.confirm(`确定删除类型「${g.name}」？删除后无法恢复。`)) return;
+    const updated = genres.filter((x) => x.id !== g.id);
     setGenres(updated);
     saveGenres(updated);
   };
@@ -133,25 +178,32 @@ export function GenreManager() {
         </button>
       </div>
       {showForm && (
-        <div style={{ background: "var(--bg-white)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 20, marginBottom: 16 }}>
-          <h3 style={{ fontSize: 15, marginBottom: 12 }}>{editing ? "编辑类型" : "新增类型"}</h3>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <input placeholder="类型名称" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14 }} />
-            <input placeholder="简要描述" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14 }} />
-            <textarea placeholder="AI 生成提示（告诉 AI 这个类型应该生成什么样的世界和角色）" value={form.promptHint}
-              onChange={(e) => setForm({ ...form, promptHint: e.target.value })} rows={3}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14, fontFamily: "inherit", resize: "vertical" }} />
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn-primary" onClick={handleSave}>保存</button>
+        <div className="form-card" ref={formRef}>
+          <h3>{editing ? "编辑类型" : "新增类型"}</h3>
+          <div className="form-stack">
+            <label className="form-field">
+              类型名称 *
+              <input placeholder="例如：西方奇幻" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+            </label>
+            <label className="form-field">
+              简要描述
+              <textarea placeholder="一两句话说明这个类型的题材特点和读者期待" rows={2} value={form.description}
+                onChange={(e) => setForm({ ...form, description: e.target.value })} />
+            </label>
+            <label className="form-field">
+              AI 创作指导
+              <textarea placeholder="告诉 AI 这个类型该如何构建世界观、塑造角色、设计核心冲突与叙事风格。生成框架和章节时会注入提示词。" rows={7} value={form.promptHint}
+                onChange={(e) => setForm({ ...form, promptHint: e.target.value })} />
+            </label>
+            <div className="toolbar-actions">
+              <button className="btn-primary" onClick={handleSave} disabled={!form.name.trim()}>保存</button>
               <button className="btn-outline" onClick={() => { setShowForm(false); setEditing(null); }}>取消</button>
             </div>
           </div>
         </div>
       )}
 
-      <table className="chapter-table">
+      <table className="chapter-table genre-table">
         <thead>
           <tr>
             <th>类型</th>
@@ -161,22 +213,34 @@ export function GenreManager() {
           </tr>
         </thead>
         <tbody>
-          {genres.map((g) => (
-            <tr key={g.id}>
-              <td style={{ fontWeight: 500 }}>{g.name} {g.isDefault && <span className="tag">默认</span>}</td>
-              <td style={{ color: "var(--text-secondary)", fontSize: 13 }}>{g.description}</td>
-              <td style={{ color: "var(--text-dim)", fontSize: 13, maxWidth: 300 }}>{g.promptHint}</td>
-              <td>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button className="btn-sm" onClick={() => handleEdit(g)}>编辑</button>
-                  {!g.isDefault && (
-                    <button className="btn-sm" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
-                      onClick={() => handleDelete(g.id)}>删除</button>
+          {genres.map((g) => {
+            const isOpen = expanded.has(g.id);
+            return (
+              <tr key={g.id}>
+                <td className="genre-name-cell">{g.name} {g.isDefault && <span className="tag">默认</span>}</td>
+                <td className="genre-desc-cell">
+                  <div className={`clamp-text${isOpen ? " expanded" : ""}`}>{g.description}</div>
+                </td>
+                <td className="genre-hint-cell">
+                  <div className={`clamp-text${isOpen ? " expanded" : ""}`}>{g.promptHint}</div>
+                  {(g.promptHint.length > 100 || g.description.length > 100) && (
+                    <button className="clamp-toggle" onClick={() => toggleExpand(g.id)}>
+                      {isOpen ? "收起" : "展开全文"}
+                    </button>
                   )}
-                </div>
-              </td>
-            </tr>
-          ))}
+                </td>
+                <td>
+                  <div className="toolbar-actions" style={{ gap: 6 }}>
+                    <button className="btn-sm" onClick={() => handleEdit(g)}>编辑</button>
+                    {!g.isDefault && (
+                      <button className="btn-sm" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+                        onClick={() => handleDelete(g)}>删除</button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

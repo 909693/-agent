@@ -1,13 +1,13 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-
-const BATCH_CHUNK_SIZE = 100;
-import { api, type ProjectMeta, type LlmParams, type BatchProgress, type BatchComplete, type PlotProgress } from "../api";
+import { api, type ProjectMeta, type LlmParams, type PlotProgress } from "../api";
+import { startBatch, cancelBatch, subscribeBatch, getBatchState, BATCH_CHUNK_SIZE } from "../utils/batchController";
 import { ExportDialog } from "./ExportDialog";
 import { CreativeConstraintsPanel } from "./CreativeConstraintsPanel";
 import { buildCreativeConstraintsPayload } from "../utils/buildCreativeConstraints";
 import { parseOutlineToPlot } from "../utils/outlineParser";
 import { extractWorldFromOutline, extractCharactersFromOutline } from "../utils/outlineExtractors";
+import { BarChart3, ClipboardList, Download } from "lucide-react";
 
 interface Props {
   project: ProjectMeta;
@@ -37,24 +37,25 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [showExport, setShowExport] = useState(false);
   const [outlineText, setOutlineText] = useState("");
   const [outlineName, setOutlineName] = useState("");
+  const [outlineStatus, setOutlineStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [targetChapters, setTargetChapters] = useState<number | undefined>(50);
   const [plotProgress, setPlotProgress] = useState<PlotProgress | null>(null);
 
-  // Batch generation state
-  const [batchRunning, setBatchRunning] = useState(false);
+  // Batch generation: range/skip are local inputs; run state lives in a
+  // module-level controller so a batch survives navigating away from this view.
   const [batchStart, setBatchStart] = useState(1);
   const [batchEnd, setBatchEnd] = useState(1);
   const [skipWritten, setSkipWritten] = useState(true);
-  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
-  const [batchResult, setBatchResult] = useState<BatchComplete | null>(null);
-  const [chapterStatuses, setChapterStatuses] = useState<Record<number, string>>({});
+  const summarizeCancelRef = useRef(false);
 
-  // Chunked batch scheduling (single task can only cover 100 chapters; split into chunks)
-  const [chunkInfo, setChunkInfo] = useState<{ current: number; total: number } | null>(null);
-  const cancelRef = useRef(false);
-  const aggregateRef = useRef<BatchComplete>({
-    completed: 0, failed: 0, skipped: 0, total_words: 0, elapsed_seconds: 0, failed_chapters: [],
-  });
+  const bs = useSyncExternalStore(subscribeBatch, getBatchState);
+  const isThisProject = bs.projectId === project.id;
+  const batchRunning = bs.running && isThisProject;
+  const batchProgress = isThisProject ? bs.progress : null;
+  const batchResult = isThisProject ? bs.result : null;
+  const chapterStatuses: Record<number, string> = isThisProject ? bs.statuses : {};
+  const chunkInfo = isThisProject ? bs.chunkInfo : null;
+  const prevBatchRunningRef = useRef(false);
 
   // Summarize state
   const [summarizingChapters, setSummarizingChapters] = useState<Set<number>>(new Set());
@@ -91,40 +92,29 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     }).catch(() => { setOutlineText(""); setOutlineName(""); });
   }, [project.id]);
 
-  // Batch event listeners — progress updates UI; completion is consumed by the chunk scheduler via a one-shot resolver.
-  const chunkResolverRef = useRef<((c: BatchComplete) => void) | null>(null);
+  // Only the plot_progress listener lives here now; batch_progress/batch_complete
+  // are owned by the module-level batch controller (they must survive unmount).
   useEffect(() => {
-    let cancelled = false;
-    const unlisteners: UnlistenFn[] = [];
-
-    (async () => {
-      const u1 = await listen<BatchProgress>("batch_progress", (e) => {
-        setBatchProgress(e.payload);
-        setChapterStatuses(prev => ({ ...prev, [e.payload.chapter_number]: e.payload.phase }));
-      });
-      if (cancelled) { u1(); return; }
-      unlisteners.push(u1);
-
-      const u2 = await listen<BatchComplete>("batch_complete", (e) => {
-        const resolver = chunkResolverRef.current;
-        chunkResolverRef.current = null;
-        if (resolver) resolver(e.payload);
-      });
-      if (cancelled) { u2(); return; }
-      unlisteners.push(u2);
-
-      const u3 = await listen<PlotProgress>("plot_progress", (e) => {
-        setPlotProgress(e.payload);
-      });
-      if (cancelled) { u3(); return; }
-      unlisteners.push(u3);
-    })().catch(() => {});
-
-    return () => {
-      cancelled = true;
-      unlisteners.forEach(fn => fn());
-    };
+    let cancelledLocal = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<PlotProgress>("plot_progress", (e) => setPlotProgress(e.payload))
+      .then((fn) => { if (cancelledLocal) fn(); else unlisten = fn; })
+      .catch(() => {});
+    return () => { cancelledLocal = true; if (unlisten) unlisten(); };
   }, []);
+
+  // Reload chapter texts when a batch for THIS project finishes.
+  useEffect(() => {
+    if (prevBatchRunningRef.current && !batchRunning && isThisProject && plot) {
+      loadChapterTexts(plot);
+    }
+    prevBatchRunningRef.current = batchRunning;
+  }, [batchRunning, isThisProject, plot]);
+
+  // Surface controller-reported batch errors through the shared error banner.
+  useEffect(() => {
+    if (isThisProject && bs.error) setError(bs.error);
+  }, [bs.error, isThisProject]);
 
   // Set default batch range when chapters load
   useEffect(() => {
@@ -174,14 +164,34 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       loadChapterTexts(parsedPlot);
     }
 
+    // Only bootstrap world/characters from the outline skeleton when none exist
+    // yet — never clobber an already-generated (richer) world/character set.
     const worldDraft = extractWorldFromOutline(text);
-    await api.saveWorldData(project.id, worldDraft);
-    setWorld(worldDraft);
+    const worldHasDraft = !!(worldDraft && (worldDraft.overview || worldDraft.era || worldDraft.factions?.length));
+    const worldExists = !!(world && (world.overview || world.era || world.factions?.length));
+    if (worldHasDraft && !worldExists) {
+      await api.saveWorldData(project.id, worldDraft);
+      setWorld(worldDraft);
+    }
 
     const characterDraft = extractCharactersFromOutline(text);
-    if (characterDraft.characters.length > 0) {
+    const charactersExist = !!(characters?.characters?.length);
+    if (characterDraft.characters.length > 0 && !charactersExist) {
       await api.saveCharactersData(project.id, characterDraft);
       setCharacters(characterDraft);
+    }
+  };
+
+  const handleSaveOutline = async () => {
+    setError("");
+    setOutlineStatus("saving");
+    try {
+      await saveOutline(outlineText, outlineName || "手动导入大纲");
+      setOutlineStatus("saved");
+      setTimeout(() => setOutlineStatus((s) => (s === "saved" ? "idle" : s)), 3000);
+    } catch (e: any) {
+      setOutlineStatus("idle");
+      setError(`保存大纲失败：${e}`);
     }
   };
 
@@ -206,7 +216,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
     setLoading("world"); setError("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(project.genre);
       setWorld(await api.generateWorld(project.id, llm, payload));
     }
     catch (e: any) { setError(e.toString()); }
@@ -217,7 +227,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
     setLoading("characters"); setError("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(project.genre);
       setCharacters(await api.generateCharacters(project.id, llm, payload));
     }
     catch (e: any) { setError(e.toString()); }
@@ -228,7 +238,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
     setLoading("plot"); setError(""); setPlotProgress(null);
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(project.genre);
       const p = await api.generatePlot(project.id, llm, payload, targetChapters);
       setPlot(p);
       loadChapterTexts(p);
@@ -238,7 +248,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const handleGenerateAll = async () => {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(project.genre);
       setError("");
       setLoading("world");
       setWorld(await api.generateWorld(project.id, llm, payload));
@@ -254,76 +264,25 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
 
   const handleBatchGenerate = async () => {
     if (!llm.apiKey) { setError("请先在系统设置中配置 API Key"); return; }
+    if (bs.running) { setError(isThisProject ? "批量生成已在运行中" : "已有其它项目的批量任务在运行中，请先取消它"); return; }
     if (batchStart > batchEnd) { setError("起始章号不能大于结束章号"); return; }
     setError("");
-    setBatchResult(null);
-    setChapterStatuses({});
-    aggregateRef.current = {
-      completed: 0, failed: 0, skipped: 0, total_words: 0, elapsed_seconds: 0, failed_chapters: [],
-    };
-    cancelRef.current = false;
-    setBatchRunning(true);
-
-    const chunks: Array<{ from: number; to: number }> = [];
-    for (let from = batchStart; from <= batchEnd; from += BATCH_CHUNK_SIZE) {
-      chunks.push({ from, to: Math.min(from + BATCH_CHUNK_SIZE - 1, batchEnd) });
-    }
-    setChunkInfo({ current: 0, total: chunks.length });
-
-    try {
-      const payload = await buildCreativeConstraintsPayload();
-      for (let i = 0; i < chunks.length; i++) {
-        if (cancelRef.current) break;
-        const { from, to } = chunks[i];
-        setChunkInfo({ current: i + 1, total: chunks.length });
-
-        const done = new Promise<BatchComplete>((resolve, reject) => {
-          chunkResolverRef.current = resolve;
-          setTimeout(() => reject(new Error("batch_complete 事件超时")), 600_000);
-        });
-
-        try {
-          await api.batchGenerateChapters(
-            project.id, from, to,
-            project.target_chapter_words || 3000, skipWritten, llm, payload,
-          );
-        } catch (e: any) {
-          chunkResolverRef.current = null;
-          setError(`第 ${i + 1}/${chunks.length} 批启动失败：${e}`);
-          break;
-        }
-
-        let chunkResult: BatchComplete;
-        try {
-          chunkResult = await done;
-        } catch (e: any) {
-          chunkResolverRef.current = null;
-          setError(e.message || "批量生成超时");
-          break;
-        }
-        const agg = aggregateRef.current;
-        agg.completed += chunkResult.completed;
-        agg.failed += chunkResult.failed;
-        agg.skipped += chunkResult.skipped;
-        agg.total_words += chunkResult.total_words;
-        agg.elapsed_seconds += chunkResult.elapsed_seconds;
-        agg.failed_chapters = agg.failed_chapters.concat(chunkResult.failed_chapters);
-
-        // If this chunk was cancelled mid-way, stop scheduling more chunks.
-        if (batchProgress?.phase === "cancelled" || cancelRef.current) break;
-      }
-    } finally {
-      setBatchResult({ ...aggregateRef.current });
-      setBatchRunning(false);
-      setChunkInfo(null);
-      chunkResolverRef.current = null;
-      if (plot) loadChapterTexts(plot);
-    }
+    const payload = await buildCreativeConstraintsPayload();
+    // Fire-and-forget: the controller drives the UI via the subscription and keeps
+    // running even if this component unmounts (navigating away and back).
+    void startBatch({
+      projectId: project.id,
+      from: batchStart,
+      to: batchEnd,
+      targetWords: project.target_chapter_words || 3000,
+      skipWritten,
+      llm,
+      payload,
+    });
   };
 
-  const handleCancelBatch = async () => {
-    cancelRef.current = true;
-    try { await api.cancelBatchGeneration(); } catch (e: any) { setError(e.toString()); }
+  const handleCancelBatch = () => {
+    cancelBatch();
   };
 
   // === Tracking data processing ===
@@ -427,14 +386,19 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     const globalIdx = flat.findIndex(f => f.ch.number === allChapters[chIdx]?.number);
     const swapIdx = direction === "up" ? globalIdx - 1 : globalIdx + 1;
     if (swapIdx < 0 || swapIdx >= flat.length) return;
-    // Swap chapter numbers
-    const tmpNum = flat[globalIdx].ch.number;
-    flat[globalIdx].ch.number = flat[swapIdx].ch.number;
-    flat[swapIdx].ch.number = tmpNum;
-    // Save
+    // Swap chapter numbers in the outline...
+    const numG = flat[globalIdx].ch.number;
+    const numS = flat[swapIdx].ch.number;
+    flat[globalIdx].ch.number = numS;
+    flat[swapIdx].ch.number = numG;
     try {
       await api.savePlotOutline(project.id, newPlot);
+      // ...and swap the stored text + summary so each outline entry keeps its own
+      // content (text/summaries are number-keyed and would otherwise desync).
+      await api.swapChapters(project.id, numG, numS);
       setPlot(newPlot);
+      loadChapterTexts(newPlot);
+      api.getChapterSummaries(project.id).then(setSummaries).catch(() => {});
     } catch (e: any) { setError(e.toString()); }
   };
 
@@ -458,10 +422,11 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       return written && !hasSummary;
     });
     if (chaptersToSummarize.length === 0) return;
+    summarizeCancelRef.current = false;
     setSummarizingAll(true);
     try {
       for (const ch of chaptersToSummarize) {
-        if (cancelRef.current) break;
+        if (summarizeCancelRef.current) break;
         await handleSummarizeChapter(ch.number);
       }
     } finally {
@@ -475,12 +440,25 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const relationshipEdges = characterList.flatMap((c: any) =>
     (c.relationships || []).map((r: any) => ({ from: c.name, to: r.target, type: r.rel_type, description: r.description }))
   );
-  const relationGroups = {
-    allies: relationshipEdges.filter((e: any) => ["ally", "friend", "mentor", "family", "relationship"].includes(e.type)),
-    rivals: relationshipEdges.filter((e: any) => ["rival", "enemy", "antagonist"].includes(e.type)),
-    lovers: relationshipEdges.filter((e: any) => ["lover", "romance"].includes(e.type)),
-    others: relationshipEdges.filter((e: any) => !["ally", "friend", "mentor", "family", "relationship", "rival", "enemy", "antagonist", "lover", "romance"].includes(e.type)),
+  // rel_type is a free-form LLM field (usually Chinese, e.g. 师徒/宿敌/爱慕),
+  // so bucket by keyword — match the type first, fall back to the description.
+  type RelGroup = "allies" | "rivals" | "lovers" | "others";
+  const REL_PATTERNS: [RelGroup, RegExp][] = [
+    ["lovers", /lover|romance|恋|爱慕|爱人|情侣|道侣|夫妻|眷侣|暧昧|倾心|情愫|心上人|青梅竹马/i],
+    ["rivals", /rival|enemy|antagonist|nemesis|敌|仇|对立|对手|竞争|背叛|追杀|忌惮|提防/i],
+    ["allies", /ally|allies|friend|mentor|family|盟|同伴|伙伴|友|同门|同修|师|徒|兄|弟|姐|妹|父|母|家人|亲人|扶持|信任|忠诚|守护|恩人|救命/i],
+  ];
+  const classifyRelation = (text: string): RelGroup | null => {
+    if (!text) return null;
+    for (const [group, pattern] of REL_PATTERNS) {
+      if (pattern.test(text)) return group;
+    }
+    return null;
   };
+  const relationGroups: Record<RelGroup, any[]> = { allies: [], rivals: [], lovers: [], others: [] };
+  for (const edge of relationshipEdges) {
+    relationGroups[classifyRelation(edge.type) ?? classifyRelation(edge.description) ?? "others"].push(edge);
+  }
   if (plot?.acts) {
     for (const act of plot.acts) {
       for (const ch of act.chapters || []) {
@@ -494,7 +472,10 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       <div className="project-info-bar">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
           <h2>{project.title}</h2>
-          <button className="btn-outline" onClick={() => setShowExport(true)}>📥 导出</button>
+          <button className="btn-outline" onClick={() => setShowExport(true)}>
+            <Download size={15} style={{ verticalAlign: -2, marginRight: 5 }} />
+            导出
+          </button>
         </div>
         <div className="project-meta">
           <span className="genre-tag">{genreLabels[project.genre] || project.genre}</span>
@@ -521,8 +502,11 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
           placeholder="你可以直接粘贴全书大纲 / 分卷大纲 / 章节大纲..."
           style={{ width: "100%", padding: "12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14, fontFamily: "inherit", resize: "vertical" }}
         />
-        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-          <button className="btn-primary" onClick={() => void saveOutline(outlineText, outlineName || "手动导入大纲")} disabled={!outlineText.trim()}>保存大纲</button>
+        <div style={{ display: "flex", gap: 12, marginTop: 12, alignItems: "center" }}>
+          <button className="btn-primary" onClick={handleSaveOutline} disabled={!outlineText.trim() || outlineStatus === "saving"}>
+            {outlineStatus === "saving" ? <><span className="loading-spinner" />保存中...</> : "保存大纲"}
+          </button>
+          {outlineStatus === "saved" && <span className="saved-tag">✓ 已保存，框架生成与章节创作将优先参照此大纲</span>}
         </div>
       </div>
 
@@ -649,22 +633,17 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                 </div>
               )}
               <div className="relation-groups-grid">
-                <div className="relation-group-card">
-                  <h4>盟友 / 同伴</h4>
-                  {relationGroups.allies.length === 0 ? <p className="dim">暂无</p> : relationGroups.allies.map((edge: any, idx: number) => <div key={idx} className="relation-item"><strong>{edge.from}</strong><span>→</span><strong>{edge.to || "未知角色"}</strong></div>)}
-                </div>
-                <div className="relation-group-card">
-                  <h4>对立 / 宿敌</h4>
-                  {relationGroups.rivals.length === 0 ? <p className="dim">暂无</p> : relationGroups.rivals.map((edge: any, idx: number) => <div key={idx} className="relation-item"><strong>{edge.from}</strong><span>→</span><strong>{edge.to || "未知角色"}</strong></div>)}
-                </div>
-                <div className="relation-group-card">
-                  <h4>情感 / 暧昧</h4>
-                  {relationGroups.lovers.length === 0 ? <p className="dim">暂无</p> : relationGroups.lovers.map((edge: any, idx: number) => <div key={idx} className="relation-item"><strong>{edge.from}</strong><span>→</span><strong>{edge.to || "未知角色"}</strong></div>)}
-                </div>
-                <div className="relation-group-card">
-                  <h4>其他联系</h4>
-                  {relationGroups.others.length === 0 ? <p className="dim">暂无</p> : relationGroups.others.map((edge: any, idx: number) => <div key={idx} className="relation-item"><strong>{edge.from}</strong><span>→</span><strong>{edge.to || "未知角色"}</strong></div>)}
-                </div>
+                {([["盟友 / 同伴", relationGroups.allies], ["对立 / 宿敌", relationGroups.rivals], ["情感 / 暧昧", relationGroups.lovers], ["其他联系", relationGroups.others]] as [string, any[]][]).map(([title, edges]) => (
+                  <div key={title} className="relation-group-card">
+                    <h4>{title}</h4>
+                    {edges.length === 0 ? <p className="dim">暂无</p> : edges.map((edge: any, idx: number) => (
+                      <div key={idx} className="relation-item">
+                        <strong>{edge.from}</strong><span>→</span><strong>{edge.to || "未知角色"}</strong>
+                        {edge.type && <span className="rel-tag">{edge.type}</span>}
+                      </div>
+                    ))}
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -741,7 +720,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
         <div>
           {allChapters.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">📋</div>
+              <div className="empty-icon"><ClipboardList size={28} /></div>
               <p>请先生成情节大纲</p>
             </div>
           ) : (
@@ -910,11 +889,11 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                             disabled={summarizingChapters.has(ch.number) || !llm.apiKey}
                             title={summaries?.[String(ch.number)] ? "重新生成摘要" : "生成摘要"}
                           >
-                            {summarizingChapters.has(ch.number) ? <span className="loading-spinner" /> : summaries?.[String(ch.number)] ? "✓ 摘要" : "摘要"}
+                            {summarizingChapters.has(ch.number) ? <span className="loading-spinner" /> : summaries?.[String(ch.number)] ? "已摘要" : "摘要"}
                           </button>
                         )}
-                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "up")} disabled={idx === 0} title="上移">↑</button>
-                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "down")} disabled={idx === allChapters.length - 1} title="下移">↓</button>
+                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "up")} disabled={idx === 0 || bs.running} title="上移">↑</button>
+                        <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "down")} disabled={idx === allChapters.length - 1 || bs.running} title="下移">↓</button>
                       </td>
                     </tr>
                   );
@@ -930,7 +909,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
         <div>
           {!summaries || Object.keys(summaries).length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">📊</div>
+              <div className="empty-icon"><BarChart3 size={28} /></div>
               <p>暂无追踪数据，请先生成章节并运行摘要</p>
             </div>
           ) : (

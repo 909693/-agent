@@ -98,6 +98,10 @@ function App() {
   const handleProjectCreated = (project: ProjectMeta) => {
     setProjects(prev => [project, ...prev]);
     setCurrentProject(project);
+    // Reset per-project agent/chat state so the previous project's Agent history
+    // and create-chat draft don't bleed into the new project.
+    setAgentMessages([]);
+    setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
     setPage("chapters");
   };
 
@@ -148,6 +152,12 @@ function App() {
     mcp: "MCP 管理",
     agent: "AI 助手",
   };
+  const pageShellClass =
+    page === "editor" || page === "chapters"
+      ? "page-shell page-shell--wide"
+      : page === "chat" || page === "agent"
+        ? "page-shell page-shell--fill"
+        : "page-shell";
   return (
     <ErrorBoundary>
     <div className="app">
@@ -181,65 +191,67 @@ function App() {
               onClose={() => setShowCreateDialog(false)}
             />
           )}
-          {page === "dashboard" && (
-            <Dashboard
-              projects={projects}
-              onNewNovel={handleNewProject}
-              onNewNovelChat={handleNewProjectChat}
-              onImportOutline={() => setShowOutlineImporter(true)}
-              onSelectNovel={handleSelectProject}
-            />
-          )}
-          {page === "novels" && (
-            <NovelList
-              projects={projects}
-              onNewNovel={handleNewProject}
-              onImportOutline={() => setShowOutlineImporter(true)}
-              onSelectNovel={handleSelectProject}
-              onDeleteNovel={handleDeleteProject}
-            />
-          )}
-          {page === "chapters" && currentProject && (
-            <ChapterManager
-              project={currentProject}
-              llm={llm}
-              onWriteChapter={handleWriteChapter}
-            />
-          )}
-          {page === "editor" && currentProject && (
-            <ChapterEditor
-              projectId={currentProject.id}
-              llm={llm}
-              initialChapter={activeChapter}
-              onBack={() => setPage("chapters")}
-            />
-          )}
-          {page === "settings" && (
-            <SettingsPage llm={llm} onChange={setLlm} theme={theme} onThemeChange={setTheme} />
-          )}
-          {page === "chat" && (
-            <ChatCreator
-              llm={llm}
-              draft={chatDraft}
-              onDraftChange={setChatDraft}
-              onProjectCreated={handleProjectCreated}
-              onCancel={() => setPage(currentProject ? "chapters" : "dashboard")}
-            />
-          )}
-          {page === "prompts" && <PromptLibrary />}
-          {page === "goals" && <WritingGoals />}
-          {page === "genres" && <GenreManager />}
-          {page === "skills" && <SkillsManager />}
-          {page === "mcp" && <McpManager />}
-          {page === "agent" && currentProject && (
-            <AgentChat
-              projectId={currentProject.id}
-              llm={llm}
-              messages={agentMessages}
-              onMessagesChange={setAgentMessages}
-              onAction={() => {}}
-            />
-          )}
+          <div className={pageShellClass}>
+            {page === "dashboard" && (
+              <Dashboard
+                projects={projects}
+                onNewNovel={handleNewProject}
+                onNewNovelChat={handleNewProjectChat}
+                onImportOutline={() => setShowOutlineImporter(true)}
+                onSelectNovel={handleSelectProject}
+              />
+            )}
+            {page === "novels" && (
+              <NovelList
+                projects={projects}
+                onNewNovel={handleNewProject}
+                onImportOutline={() => setShowOutlineImporter(true)}
+                onSelectNovel={handleSelectProject}
+                onDeleteNovel={handleDeleteProject}
+              />
+            )}
+            {page === "chapters" && currentProject && (
+              <ChapterManager
+                project={currentProject}
+                llm={llm}
+                onWriteChapter={handleWriteChapter}
+              />
+            )}
+            {page === "editor" && currentProject && (
+              <ChapterEditor
+                projectId={currentProject.id}
+                llm={llm}
+                initialChapter={activeChapter}
+                onBack={() => setPage("chapters")}
+              />
+            )}
+            {page === "settings" && (
+              <SettingsPage llm={llm} onChange={setLlm} theme={theme} onThemeChange={setTheme} />
+            )}
+            {page === "chat" && (
+              <ChatCreator
+                llm={llm}
+                draft={chatDraft}
+                onDraftChange={setChatDraft}
+                onProjectCreated={handleProjectCreated}
+                onCancel={() => setPage(currentProject ? "chapters" : "dashboard")}
+              />
+            )}
+            {page === "prompts" && <PromptLibrary />}
+            {page === "goals" && <WritingGoals />}
+            {page === "genres" && <GenreManager />}
+            {page === "skills" && <SkillsManager />}
+            {page === "mcp" && <McpManager />}
+            {page === "agent" && currentProject && (
+              <AgentChat
+                projectId={currentProject.id}
+                llm={llm}
+                messages={agentMessages}
+                onMessagesChange={setAgentMessages}
+                onAction={() => {}}
+              />
+            )}
+          </div>
         </div>
       </div>
     </div>

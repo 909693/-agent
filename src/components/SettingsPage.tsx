@@ -21,6 +21,11 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
   const [profilesLoaded, setProfilesLoaded] = useState(false);
   const [testResult, setTestResult] = useState("");
   const [testing, setTesting] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [showModels, setShowModels] = useState(false);
+  const [modelFilter, setModelFilter] = useState("");
 
   useEffect(() => {
     api.getDataDir().then(setDataDir).catch(() => setDataDir("未知"));
@@ -49,7 +54,34 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
     // Load saved profile for new format, keep proxyUrl from current config
     const saved = updated[newFormat] || { apiKey: "", model: "", baseUrl: "" };
     onChange({ apiFormat: newFormat, apiKey: saved.apiKey, model: saved.model, baseUrl: saved.baseUrl, proxyUrl: llm.proxyUrl });
+
+    // Fetched model list belongs to the previous provider — discard it
+    setModels([]);
+    setShowModels(false);
+    setModelsError("");
+    setModelFilter("");
   };
+
+  const handleFetchModels = async () => {
+    setFetchingModels(true);
+    setModelsError("");
+    try {
+      const list = await api.fetchModels(llm.apiFormat, llm.apiKey, llm.baseUrl, llm.proxyUrl);
+      setModels(list);
+      setModelFilter("");
+      setShowModels(true);
+    } catch (e: any) {
+      setModels([]);
+      setShowModels(false);
+      setModelsError(e.toString());
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  const filteredModels = models.filter(m =>
+    m.toLowerCase().includes(modelFilter.trim().toLowerCase())
+  );
 
   const handleChangeDir = async (migrate: boolean) => {
     try {
@@ -134,11 +166,52 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
 
         <div className="form-group">
           <label>模型名称</label>
-          <input
-            value={llm.model}
-            onChange={e => onChange({ ...llm, model: e.target.value })}
-            placeholder={fh.modelPlaceholder}
-          />
+          <div className="model-input-row">
+            <input
+              value={llm.model}
+              onChange={e => onChange({ ...llm, model: e.target.value })}
+              placeholder={fh.modelPlaceholder}
+            />
+            <button
+              className="btn-outline"
+              disabled={fetchingModels || !llm.apiKey}
+              title={!llm.apiKey ? "请先填写 API Key" : "从 API 拉取可用模型列表"}
+              onClick={handleFetchModels}
+            >
+              {fetchingModels ? "拉取中..." : "拉取模型"}
+            </button>
+          </div>
+          {modelsError && <div className="model-fetch-error">{modelsError}</div>}
+          {showModels && (
+            <div className="model-list-panel">
+              <div className="model-list-head">
+                <input
+                  autoFocus
+                  value={modelFilter}
+                  onChange={e => setModelFilter(e.target.value)}
+                  placeholder={`搜索 ${models.length} 个模型...`}
+                />
+                <button className="btn-outline" onClick={() => setShowModels(false)}>收起</button>
+              </div>
+              <div className="model-list-items">
+                {filteredModels.map(m => (
+                  <div
+                    key={m}
+                    className={`model-list-item ${m === llm.model ? "active" : ""}`}
+                    onClick={() => {
+                      onChange({ ...llm, model: m });
+                      setShowModels(false);
+                    }}
+                  >
+                    {m}
+                  </div>
+                ))}
+                {filteredModels.length === 0 && (
+                  <div className="model-list-empty">无匹配模型</div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="form-group">

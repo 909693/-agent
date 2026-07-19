@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ClipboardList } from "lucide-react";
 
 interface Prompt {
   id: string;
@@ -36,7 +37,7 @@ const DEFAULT_PROMPTS: Prompt[] = [
   { id: "d9b", title: "悬疑迷雾·层层剥茧", category: "环境氛围", content: "请营造一段悬疑/推理氛围（案发现场/密室/雨夜侦查/嫌疑人审讯室等），要求：1.信息投放要精准——每个场景细节都可能是线索，也可能是误导，让读者主动参与推理；2.运用'不可靠叙述'——通过角色的主观视角过滤信息，让读者看到的不一定是真相全貌；3.时间压力感——倒计时、即将到来的危险、稍纵即逝的线索，制造紧迫感；4.环境要有'密闭感'——即使在开阔空间也要通过心理描写营造被困的感觉（大雾封路、暴雨阻隔、通讯中断）；5.每个场景结束时要留下一个新的疑问，像俄罗斯套娃一样层层嵌套。字数400-600字。" },
   { id: "d10", title: "浪漫唯美·岁月静好", category: "环境氛围", content: "请营造一段浪漫/唯美氛围（樱花树下/海边日落/雪夜壁炉/古镇烟雨等），要求：1.色彩是浪漫氛围的灵魂——运用柔和的暖色调（琥珀色的夕阳、玫瑰金的晚霞、月光银的湖面），避免过于鲜艳刺眼的颜色；2.时间要'慢下来'——用细腻的描写拉长每一个瞬间（花瓣飘落的轨迹、光线移动的速度、风吹过发丝的弧度）；3.五感要柔化——声音是轻柔的（风铃、流水、远处的琴声），气味是温暖的（花香、咖啡、旧书页），触感是舒适的（阳光、微风、棉麻）；4.在美好中嵌入一丝'易逝感'——樱花终会落、夕阳终会沉，这种无常让浪漫更加珍贵；5.氛围要为情感服务，不是单纯的风景描写，而是角色内心世界的外化。字数300-500字。" },
   { id: "d10b", title: "史诗磅礴·天地苍茫", category: "环境氛围", content: "请营造一段史诗/磅礴氛围（大军出征/王朝覆灭/天地异象/远古遗迹等），要求：1.空间尺度要宏大——从个体视角拉升到天地视角，让读者感受到人在历史洪流中的渺小与伟大；2.运用'天人感应'的手法——自然异象呼应人事变迁（王朝将倾时的血月、英雄陨落时的流星、大战前夕的地震）；3.声音要有'重量感'——战鼓如雷、号角撕裂长空、万人齐呼的声浪、或者比喧嚣更震撼的死寂；4.时间感要有纵深——在描写当下的同时，用简短的笔触勾连过去和未来（'千年前，同样的城墙下...'）；5.史诗感的核心是'命运感'——让读者感受到某种不可抗拒的历史力量正在推动一切。字数400-700字。" },
-  { id: "d11", title: "网文全维度审校", category: "审校检查", content: "你是一位拥有12年+网文行业从业经验的资深编辑，兼具小说创作指导与纵横、番茄、起点三大平台审核合规经验。请对提供的章节进行全维度检查，包括：1.逻辑体系（剧情推进、场景转换、伏笔回收、细节一致性）2.人设一致性（言行统一、成长轨迹、互动自然度）3.剧情节奏（张弛有度、爽点/情绪点、章节钩子）4.文字规范（语病错字、网文表达、排版、风格统一）5.平台合规性（违规内容、敏感词、字数适配）6.核心竞争力（差异化亮点、读者留存、平台适配）。对每个问题标注严重程度：🔴致命 🟡重要 🔵轻微，最后给出综合评分和修改建议。" },
+  { id: "d11", title: "网文全维度审校", category: "审校检查", content: "你是一位拥有12年+网文行业从业经验的资深编辑，兼具小说创作指导与纵横、番茄、起点三大平台审核合规经验。请对提供的章节进行全维度检查，包括：1.逻辑体系（剧情推进、场景转换、伏笔回收、细节一致性）2.人设一致性（言行统一、成长轨迹、互动自然度）3.剧情节奏（张弛有度、爽点/情绪点、章节钩子）4.文字规范（语病错字、网文表达、排版、风格统一）5.平台合规性（违规内容、敏感词、字数适配）6.核心竞争力（差异化亮点、读者留存、平台适配）。对每个问题标注严重程度：[致命] [重要] [轻微]，最后给出综合评分和修改建议。" },
   { id: "d12", title: "逻辑Bug排查", category: "审校检查", content: "请专项检查本章的逻辑问题：1.剧情推进是否合理，有无突兀跳转 2.人物行为决策是否符合场景逻辑 3.时间线是否有矛盾 4.空间设定是否前后统一 5.数值体系是否一致 6.伏笔是否有遗漏。逐段排查，标注每处问题的具体位置和严重程度。" },
   { id: "d13", title: "平台合规筛查", category: "审校检查", content: "请对本章进行三大平台（番茄、起点、纵横）合规性检查：1.排查低俗色情、暴力血腥、封建迷信、时政敏感等违规内容 2.筛查敏感词并给出替换建议 3.检查字数是否适配目标平台 4.排查版权侵权风险 5.检查是否有诱导互动、虚假宣传等问题。标注每处违规的具体位置和风险等级。" },
 ];
@@ -45,10 +46,20 @@ const PROMPTS_VERSION = "v2"; // bump this to force refresh defaults
 
 function loadPrompts(): Prompt[] {
   try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    const storedList: Prompt[] = stored ? JSON.parse(stored) : [];
     const ver = localStorage.getItem(STORAGE_KEY + "_ver");
     if (ver === PROMPTS_VERSION) {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) return JSON.parse(stored);
+      if (stored) return storedList;
+    } else if (Array.isArray(storedList) && storedList.length > 0) {
+      // Version bump: MERGE fresh defaults with the user's own prompts instead of
+      // overwriting — otherwise every user-created prompt is wiped.
+      const defaultIds = new Set(DEFAULT_PROMPTS.map((p) => p.id));
+      const userPrompts = storedList.filter((p) => p && !defaultIds.has(p.id));
+      const merged = [...DEFAULT_PROMPTS, ...userPrompts];
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      localStorage.setItem(STORAGE_KEY + "_ver", PROMPTS_VERSION);
+      return merged;
     }
   } catch { /* ignore */ }
   localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_PROMPTS));
@@ -116,14 +127,13 @@ export function PromptLibrary() {
         </button>
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+      <div className="filter-bar">
         {["全部", ...CATEGORIES].map((c) => (
-          <button key={c} className={`btn-sm ${filter === c ? "" : ""}`}
-            style={filter === c ? { background: "var(--accent)", color: "white", borderColor: "var(--accent)" } : {}}
+          <button key={c} className={`btn-sm ${filter === c ? "active" : ""}`}
             onClick={() => setFilter(c)}>{c}</button>
         ))}
         <input
-          style={{ marginLeft: "auto", padding: "6px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 13, width: 200 }}
+          className="search-input"
           placeholder="搜索提示词..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -136,18 +146,15 @@ export function PromptLibrary() {
         </div>
       )}
       {showForm && (
-        <div style={{ background: "var(--bg-white)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 20, marginBottom: 16 }}>
-          <h3 style={{ fontSize: 15, marginBottom: 12 }}>{editing ? "编辑提示词" : "新建提示词"}</h3>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <input placeholder="标题" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14 }} />
-            <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14 }}>
+        <div className="form-card">
+          <h3>{editing ? "编辑提示词" : "新建提示词"}</h3>
+          <div className="form-stack">
+            <input placeholder="标题" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+            <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
               {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
-            <textarea placeholder="提示词内容" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} rows={4}
-              style={{ padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 14, fontFamily: "inherit", resize: "vertical" }} />
-            <div style={{ display: "flex", gap: 8 }}>
+            <textarea placeholder="提示词内容" value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} rows={4} />
+            <div className="toolbar-actions">
               <button className="btn-primary" onClick={handleSave}>保存</button>
               <button className="btn-outline" onClick={() => { setShowForm(false); setEditing(null); }}>取消</button>
             </div>
@@ -172,7 +179,7 @@ export function PromptLibrary() {
       </div>
       {filtered.length === 0 && (
         <div className="empty-state">
-          <div className="empty-icon">📋</div>
+          <div className="empty-icon"><ClipboardList size={28} /></div>
           <p>没有匹配的提示词</p>
         </div>
       )}

@@ -52,7 +52,9 @@ export function OutlineImporter({ onCreated, onClose }: Props) {
     if (!title.trim() || !outlineText.trim()) { setError("标题和大纲不能为空"); return; }
     setLoading(true); setError("");
     try {
-      const premise = outlineText.slice(0, 300);
+      // Slice by code points, not UTF-16 units, so a surrogate pair isn't split
+      // into a lone surrogate (which serde_json rejects at the Tauri boundary).
+      const premise = Array.from(outlineText).slice(0, 300).join("");
       const project = await api.createProject({
         title: title.trim(),
         genre,
@@ -61,16 +63,23 @@ export function OutlineImporter({ onCreated, onClose }: Props) {
         themes: themes.split(/[,，]/).map(s => s.trim()).filter(Boolean),
         targetChapterWords: 3000,
       });
-      await api.saveOutlineSource(project.id, { name: outlineName || "手动导入大纲", text: outlineText, importedAt: new Date().toISOString() });
-      const parsedPlot = parseOutlineToPlot(outlineText);
-      if (parsedPlot.acts.length > 0) {
-        await api.savePlotOutline(project.id, parsedPlot);
-      }
-      const world = extractWorldFromOutline(outlineText);
-      await api.saveWorldData(project.id, world);
-      const characters = extractCharactersFromOutline(outlineText);
-      if (characters.characters.length > 0) {
-        await api.saveCharactersData(project.id, characters);
+      try {
+        await api.saveOutlineSource(project.id, { name: outlineName || "手动导入大纲", text: outlineText, importedAt: new Date().toISOString() });
+        const parsedPlot = parseOutlineToPlot(outlineText);
+        if (parsedPlot.acts.length > 0) {
+          await api.savePlotOutline(project.id, parsedPlot);
+        }
+        const world = extractWorldFromOutline(outlineText);
+        await api.saveWorldData(project.id, world);
+        const characters = extractCharactersFromOutline(outlineText);
+        if (characters.characters.length > 0) {
+          await api.saveCharactersData(project.id, characters);
+        }
+      } catch (inner) {
+        // Roll back the half-created project so a mid-way failure doesn't leave an
+        // orphan project with no outline (and a retry producing duplicates).
+        try { await api.deleteProject(project.id); } catch { /* ignore */ }
+        throw inner;
       }
       onCreated(project);
       onClose();

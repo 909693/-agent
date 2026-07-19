@@ -110,17 +110,17 @@ export function AgentChat({ projectId, llm, messages, onMessagesChange, onAction
             }
             updateMessages(prev => [...prev, {
               role: "tool" as const,
-              content: `⏳ ${label}...`,
+              content: `[进行中] ${label}...`,
               toolName: data.name,
             }]);
             break;
           }
           case "tool_result": {
             const label = TOOL_LABELS[data.name] || data.name;
-            const icon = data.success ? "✅" : "❌";
+            const icon = data.success ? "[成功]" : "[失败]";
             const summary = data.result.length > 200 ? data.result.slice(0, 200) + "..." : data.result;
             updateMessages(prev => {
-              const idx = prev.map((m, i) => ({ m, i })).reverse().find(x => x.m.role === "tool" && x.m.toolName === data.name && x.m.content.startsWith("⏳"))?.i ?? -1;
+              const idx = prev.map((m, i) => ({ m, i })).reverse().find(x => x.m.role === "tool" && x.m.toolName === data.name && x.m.content.startsWith("[进行中]"))?.i ?? -1;
               if (idx >= 0) {
                 const updated = [...prev];
                 updated[idx] = {
@@ -166,10 +166,14 @@ export function AgentChat({ projectId, llm, messages, onMessagesChange, onAction
         }
       });
 
-      // Build history for backend (only user/assistant messages, not tool messages)
-      const history = messagesRef.current
-        .filter(m => m.role === "user" || m.role === "assistant")
-        .map(m => ({ role: m.role, content: m.content }));
+      // Build history for backend (only user/assistant messages, not tool messages).
+      // Drop the trailing copy of the message we're sending — the backend appends
+      // `userMsg` itself, so leaving it here would send the latest message twice.
+      const histMsgs = messagesRef.current.filter(m => m.role === "user" || m.role === "assistant");
+      if (histMsgs.length && histMsgs[histMsgs.length - 1].role === "user" && histMsgs[histMsgs.length - 1].content === userMsg) {
+        histMsgs.pop();
+      }
+      const history = histMsgs.map(m => ({ role: m.role, content: m.content }));
 
       const constraints = await buildCreativeConstraintsPayload();
       await api.agentChatStream(projectId, userMsg, history, llm, constraints);
@@ -194,18 +198,18 @@ export function AgentChat({ projectId, llm, messages, onMessagesChange, onAction
         {displayMsgs.map((msg, i) => (
           <div key={i} className={`agent-msg ${msg.role}`}>
             <div className="agent-msg-label">
-              {msg.role === "assistant" ? "🤖 AI 助手" : msg.role === "tool" ? "🔧 工具" : "你"}
+              {msg.role === "assistant" ? "AI 助手" : msg.role === "tool" ? "工具调用" : "你"}
             </div>
             <div className={`agent-msg-content ${msg.role === "tool" ? "tool-msg" : ""} ${msg.streaming ? "streaming" : ""}`}>
-              {msg.content.startsWith("⏳") && <span className="loading-spinner" />}
+              {msg.content.startsWith("[进行中]") && <span className="loading-spinner" />}
               <span style={{ whiteSpace: "pre-wrap" }}>{msg.content}</span>
               {msg.streaming && <span className="cursor-blink">▍</span>}
             </div>
           </div>
         ))}
-        {loading && !displayMsgs.some(m => m.streaming) && !displayMsgs.some(m => m.content?.startsWith("⏳")) && (
+        {loading && !displayMsgs.some(m => m.streaming) && !displayMsgs.some(m => m.content?.startsWith("[进行中]")) && (
           <div className="agent-msg assistant">
-            <div className="agent-msg-label">🤖 AI 助手</div>
+            <div className="agent-msg-label">AI 助手</div>
             <div className="agent-msg-content"><span className="loading-spinner" />思考中...</div>
           </div>
         )}

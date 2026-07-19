@@ -74,6 +74,9 @@ export function extractCharactersFromOutline(text: string) {
   }
 
   const names = blocks.map((b) => b.name);
+  // Resolve the actual protagonist name instead of hardcoding one, so relations
+  // point at a character that really exists in this outline.
+  const protagonistName = blocks.find((b) => roleFromLabel(b.roleLabel) === "protagonist")?.name;
   const characters = blocks.map(({ name, roleLabel, block }, idx) => {
     const age = parseField(block, ["年龄"]);
     const appearance = parseField(block, ["外貌", "形象"]);
@@ -81,7 +84,7 @@ export function extractCharactersFromOutline(text: string) {
     const background = parseField(block, ["背景", "家世", "定位"]);
     const motivationsText = parseField(block, ["核心矛盾", "目标", "命运设计", "功能"]);
     const faction = parseField(block, ["势力", "阵营"]);
-    const relationText = parseField(block, ["与叶辰的关系", "关系"]);
+    const relationText = parseField(block, ["的关系", "关系"]);
     const arcText = parseField(block, ["人物弧线"]);
     const fallbackSummary = block.slice(0, 8).join(" ");
 
@@ -97,8 +100,8 @@ export function extractCharactersFromOutline(text: string) {
         return { target: other, rel_type: relType, description: relationText || relationCandidates.slice(0, 120) };
       });
 
-    if (relationships.length === 0 && relationText) {
-      relationships.push({ target: "叶辰", rel_type: "relationship", description: relationText });
+    if (relationships.length === 0 && relationText && protagonistName && protagonistName !== name) {
+      relationships.push({ target: protagonistName, rel_type: "relationship", description: relationText });
     }
 
     return {

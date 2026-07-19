@@ -303,6 +303,8 @@ export const api = {
     invoke<string>("set_data_dir", { newDir, migrate }),
   testLlm: (apiFormat: string, apiKey: string, model: string, baseUrl: string, proxyUrl?: string) =>
     invoke<string>("test_llm", { apiFormat, apiKey, model, baseUrl, proxyUrl }),
+  fetchModels: (apiFormat: string, apiKey: string, baseUrl: string, proxyUrl?: string) =>
+    invoke<string[]>("fetch_models", { apiFormat, apiKey, baseUrl, proxyUrl }),
 
   saveLlmConfig: (config: LlmParams) => invoke("save_llm_config", { config }),
   getLlmConfig: () => invoke<LlmParams | null>("get_llm_config"),
@@ -347,8 +349,10 @@ export const api = {
   continueWriting: (projectId: string, chapterNumber: number, instruction: string, targetWords: number, llm: LlmParams, constraints?: CreativeConstraintsPayload) =>
     cancellableInvoke<ChapterData>("continue_writing", "continue_writing", { projectId, chapterNumber, instruction, targetWords, constraints, ...llmArgs(llm) }),
 
-  saveChapter: (projectId: string, chapterNumber: number, text: string) =>
-    invoke("save_chapter", { projectId, chapterNumber, text }),
+  saveChapter: (projectId: string, chapterNumber: number, text: string, snapshot?: boolean) =>
+    invoke("save_chapter", { projectId, chapterNumber, text, snapshot }),
+  swapChapters: (projectId: string, a: number, b: number) =>
+    invoke("swap_chapters", { projectId, a, b }),
   getChapter: (projectId: string, chapterNumber: number) =>
     invoke<ChapterData>("get_chapter", { projectId, chapterNumber }),
 
@@ -380,8 +384,8 @@ export const api = {
   extractFramework: (messages: [string, string][], genre: string, llm: LlmParams, constraints?: CreativeConstraintsPayload) =>
     cancellableInvoke<FrameworkData>("extract_framework", "extract_framework", { messages, genre, constraints, ...llmArgs(llm) }),
 
-  exportNovel: (projectId: string, format: string) =>
-    invoke<string>("export_novel", { projectId, format }),
+  exportNovel: (projectId: string, format: string, mode: "single" | "chapters") =>
+    invoke<{ path: string; count: number }>("export_novel", { projectId, format, mode }),
 
   // Batch generation
   batchGenerateChapters: (
