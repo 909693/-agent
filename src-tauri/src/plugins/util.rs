@@ -217,8 +217,17 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
 
 /// git 不读取 macOS 系统代理，而 GUI 应用也不继承 shell 的 proxy 环境变量，
 /// 会导致打包后的应用内 git 直连仓库直至挂死。
-/// 依次探测：环境变量 → macOS 系统 HTTPS/HTTP 代理（scutil --proxy）。
+/// 依次探测：系统设置里配置的代理地址（llm_config.json 的 proxyUrl）
+/// → 环境变量 → macOS 系统 HTTPS/HTTP 代理（scutil --proxy）。
 fn detect_proxy() -> Option<String> {
+    if let Ok(Some(config)) = crate::storage::load_llm_config() {
+        if let Some(proxy) = config["proxyUrl"].as_str() {
+            let proxy = proxy.trim();
+            if !proxy.is_empty() {
+                return Some(proxy.to_string());
+            }
+        }
+    }
     for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_string();
@@ -263,6 +272,8 @@ fn run_git(args: &[&str]) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     let mut cmd = Command::new("git");
+    // 代理下 git/curl 的 HTTP/2 常见 "Error in the HTTP2 framing layer"，强制 HTTP/1.1
+    cmd.arg("-c").arg("http.version=HTTP/1.1");
     if let Some(proxy) = detect_proxy() {
         cmd.arg("-c").arg(format!("http.proxy={}", proxy));
         cmd.arg("-c").arg(format!("https.proxy={}", proxy));
