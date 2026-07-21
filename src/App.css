@@ -1378,6 +1378,23 @@ body {
   border-color: var(--accent);
 }
 .constraints-empty { font-size: 12px; color: var(--text-dim); }
+.constraints-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.auto-prompts-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+}
+.auto-prompts-toggle input { accent-color: var(--accent); margin: 0; }
+.constraint-chip.auto-locked { cursor: default; opacity: 0.9; }
+.constraint-chip.auto-locked:not(.active) { opacity: 0.45; }
 .chat-constraints-wrap { padding: 12px 20px 0; background: var(--bg); }
 /* ===== Plugin Managers ===== */
 .plugin-shell {

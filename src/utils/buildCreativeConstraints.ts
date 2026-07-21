@@ -1,23 +1,18 @@
 import { api, type CreativeConstraintsPayload } from "../api";
-import { getCreativeConstraints } from "./creativeConstraints";
+import { getCreativeConstraints, resolveEffectivePromptIds } from "./creativeConstraints";
 import { getGenrePromptHint } from "../components/GenreManager";
+import { loadPrompts } from "./promptStore";
 
-type PromptItem = { id: string; title: string; category: string; content: string };
-
-const PROMPTS_KEY = "retl_prompts";
-
-function loadPrompts(): PromptItem[] {
-  try {
-    const raw = localStorage.getItem(PROMPTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
 
 export async function buildCreativeConstraintsPayload(genre?: string): Promise<CreativeConstraintsPayload> {
   const state = getCreativeConstraints();
-  const prompts = loadPrompts().filter((p) => state.selectedPromptIds.includes(p.id));
+  const allStoredPrompts = loadPrompts();
+  const effectiveIds = resolveEffectivePromptIds(state, genre, allStoredPrompts);
+  // Keep effectiveIds order (auto-matched style prompts first) — the backend
+  // caps the injected prompt count, so ordering decides what survives.
+  const prompts = effectiveIds
+    .map((id) => allStoredPrompts.find((p) => p.id === id))
+    .filter((p): p is NonNullable<typeof p> => !!p);
   const skillsRaw: any[] = await api.listSkills();
   // Only inject skills that are BOTH selected in the constraints panel AND still
   // enabled in the skills manager (s.enabled === false means the user disabled it).

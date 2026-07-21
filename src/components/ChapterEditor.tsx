@@ -7,6 +7,7 @@ import { checkSensitiveWords, type SensitiveMatch } from "../utils/sensitiveWord
 
 interface Props {
   projectId: string;
+  genre?: string;
   llm: LlmParams;
   initialChapter?: number;
   onBack: () => void;
@@ -31,7 +32,7 @@ interface CharacterInfo {
   relationships?: Array<{ target?: string; rel_type?: string; description?: string }>;
   arc?: { start_state?: string; end_state?: string; internal_conflict?: string };
 }
-export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Props) {
+export function ChapterEditor({ projectId, genre, llm, initialChapter = 1, onBack }: Props) {
   const [chapterNum, setChapterNum] = useState(initialChapter);
   const [text, setText] = useState("");
   const [userInput, setUserInput] = useState("");
@@ -234,7 +235,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     if (!currentChapter) { setError("缺少章节大纲"); return; }
     setLoading(true); setError("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(genre);
       const existingContext = text.trim() ? `以下是我已经写好的正文，请严格保留已写内容的核心情节和表达方向，只在不足处补充扩写：\n\n${text}` : "";
       const hintContext = fillHint.trim() ? `\n\n补充要求：${fillHint}` : "";
       const result: any = await api.expandChapter(projectId, chapterNum, `${existingContext}${hintContext}`, targetWords, llm, payload);
@@ -254,7 +255,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     if (!llm.apiKey) { setError("请先配置 API Key"); return; }
     setLoading(true); setError("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(genre);
       const result: any = await api.expandChapter(projectId, chapterNum, userInput, targetWords, llm, payload);
       const t = result.text || JSON.stringify(result);
       setText(t);
@@ -276,7 +277,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
         await api.saveChapter(projectId, chapterNum, text, false);
         loadedTextRef.current = text;
       }
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(genre);
       const result: any = await api.continueWriting(projectId, chapterNum, instruction, targetWords, llm, payload);
       // Backend appended + persisted — sync refs so a later switch flush can't
       // overwrite this with a stale draft.
@@ -295,7 +296,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     if (!text.trim()) { setError("章节内容为空，无法审校"); return; }
     setLoading(true); setError(""); setReviewResult("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(genre);
       const result = await api.reviewChapter(projectId, chapterNum, text, platform, llm, payload);
       setReviewResult(result);
     } catch (e: any) { setError(e.toString()); }
@@ -356,7 +357,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
     rewriteRangeRef.current = myRange;
     setLoading(true); setError("");
     try {
-      const payload = await buildCreativeConstraintsPayload();
+      const payload = await buildCreativeConstraintsPayload(genre);
       const result: any = await api.rewriteSelection(projectId, chapterNum, selectionText, partialHint, partialDelta, llm, payload);
       if (rewriteRangeRef.current !== myRange) return; // switched chapters / re-rewritten → drop
       setPartialPreview(result.text || "");
@@ -732,7 +733,7 @@ export function ChapterEditor({ projectId, llm, initialChapter = 1, onBack }: Pr
           </div>
         </div>
         <div className="editor-panel">
-          <CreativeConstraintsPanel collapsible />
+          <CreativeConstraintsPanel collapsible genre={genre} />
           <div className="character-reference-panel">
             <div className="character-reference-head">
               <h4>角色参考</h4>

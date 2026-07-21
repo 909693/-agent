@@ -13,6 +13,7 @@ interface AgentMessage {
 
 interface Props {
   projectId: string;
+  genre?: string;
   llm: LlmParams;
   messages: AgentMessage[];
   onMessagesChange: (msgs: AgentMessage[]) => void;
@@ -39,7 +40,7 @@ const TOOL_LABELS: Record<string, string> = {
 
 const WELCOME = "你好！我是你的 AI 写作助手。你可以直接告诉我你想做什么，比如：\n\n• 帮我生成完整框架（世界观 + 角色 + 大纲）\n• 把第一章扩写到 5000 字\n• 审校第三章\n• 导出小说\n• 叶辰的性格是什么？\n\n我会自动调用工具完成任务，无需手动确认。说吧，你想做什么？";
 
-export function AgentChat({ projectId, llm, messages, onMessagesChange, onAction }: Props) {
+export function AgentChat({ projectId, genre, llm, messages, onMessagesChange, onAction }: Props) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -175,7 +176,7 @@ export function AgentChat({ projectId, llm, messages, onMessagesChange, onAction
       }
       const history = histMsgs.map(m => ({ role: m.role, content: m.content }));
 
-      const constraints = await buildCreativeConstraintsPayload();
+      const constraints = await buildCreativeConstraintsPayload(genre);
       await api.agentChatStream(projectId, userMsg, history, llm, constraints);
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e);

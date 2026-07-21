@@ -267,7 +267,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     if (bs.running) { setError(isThisProject ? "批量生成已在运行中" : "已有其它项目的批量任务在运行中，请先取消它"); return; }
     if (batchStart > batchEnd) { setError("起始章号不能大于结束章号"); return; }
     setError("");
-    const payload = await buildCreativeConstraintsPayload();
+    const payload = await buildCreativeConstraintsPayload(project.genre);
     // Fire-and-forget: the controller drives the UI via the subscription and keeps
     // running even if this component unmounts (navigating away and back).
     void startBatch({
@@ -525,7 +525,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
 
       {error && <div className="error">{error}</div>}
       <div style={{ marginBottom: 16 }}>
-        <CreativeConstraintsPanel />
+        <CreativeConstraintsPanel genre={project.genre} />
       </div>
       {tab === "world" && (
         <div>

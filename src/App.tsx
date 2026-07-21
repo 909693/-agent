@@ -220,6 +220,7 @@ function App() {
             {page === "editor" && currentProject && (
               <ChapterEditor
                 projectId={currentProject.id}
+                genre={currentProject.genre}
                 llm={llm}
                 initialChapter={activeChapter}
                 onBack={() => setPage("chapters")}
@@ -245,6 +246,7 @@ function App() {
             {page === "agent" && currentProject && (
               <AgentChat
                 projectId={currentProject.id}
+                genre={currentProject.genre}
                 llm={llm}
                 messages={agentMessages}
                 onMessagesChange={setAgentMessages}

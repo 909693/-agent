@@ -195,7 +195,8 @@ fn build_constraints_text(constraints: Option<&Value>) -> String {
             .collect();
         if !user_prompts.is_empty() {
             let mut text = String::from("## 必须应用的提示词\n");
-            for prompt in user_prompts.iter().take(3) {
+            // 6 = 自动匹配的风格提示词（最多 3 条）+ 手动勾选的审校/自定义（最多 3 条）
+            for prompt in user_prompts.iter().take(6) {
                 let title = prompt["title"].as_str().unwrap_or("未命名提示词");
                 let category = prompt["category"].as_str().unwrap_or("未分类");
                 let content = prompt["content"].as_str().unwrap_or("");
