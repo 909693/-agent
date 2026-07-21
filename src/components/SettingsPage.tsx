@@ -51,9 +51,9 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
     setProfiles(updated);
     api.saveLlmProfiles(updated).catch(() => {});
 
-    // Load saved profile for new format, keep proxyUrl from current config
+    // Load saved profile for new format, keep proxyUrl/userAgent from current config (global, not per-profile)
     const saved = updated[newFormat] || { apiKey: "", model: "", baseUrl: "" };
-    onChange({ apiFormat: newFormat, apiKey: saved.apiKey, model: saved.model, baseUrl: saved.baseUrl, proxyUrl: llm.proxyUrl });
+    onChange({ apiFormat: newFormat, apiKey: saved.apiKey, model: saved.model, baseUrl: saved.baseUrl, proxyUrl: llm.proxyUrl, userAgent: llm.userAgent });
 
     // Fetched model list belongs to the previous provider — discard it
     setModels([]);
@@ -66,7 +66,7 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
     setFetchingModels(true);
     setModelsError("");
     try {
-      const list = await api.fetchModels(llm.apiFormat, llm.apiKey, llm.baseUrl, llm.proxyUrl);
+      const list = await api.fetchModels(llm.apiFormat, llm.apiKey, llm.baseUrl, llm.proxyUrl, llm.userAgent);
       setModels(list);
       setModelFilter("");
       setShowModels(true);
@@ -115,6 +115,12 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
   };
 
   const fh = formatHints[llm.apiFormat] || formatHints.openai;
+
+  const uaPresets: Array<{ label: string; value: string }> = [
+    { label: "Claude Code", value: "claude-cli/2.0.14 (external, cli)" },
+    { label: "Codex CLI", value: "codex_cli_rs/0.42.0 (Mac OS 15.7.4; arm64) iTerm.app" },
+    { label: "Chrome", value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" },
+  ];
 
   return (
     <div className="settings-page">
@@ -226,6 +232,30 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
           </small>
         </div>
 
+        <div className="form-group">
+          <label>User-Agent（可选）</label>
+          <input
+            value={llm.userAgent || ""}
+            onChange={e => onChange({ ...llm, userAgent: e.target.value || undefined })}
+            placeholder="留空则不发送 User-Agent"
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+            {uaPresets.map(p => (
+              <button
+                key={p.label}
+                className={`btn-outline ${llm.userAgent === p.value ? "active" : ""}`}
+                style={{ fontSize: 12, padding: "4px 12px" }}
+                onClick={() => onChange({ ...llm, userAgent: p.value })}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <small style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 4, display: "block" }}>
+            部分中转站限制客户端类型，可用预设模拟 Claude Code / Codex 等客户端；版本号可自行修改
+          </small>
+        </div>
+
         <div className="settings-hint-box">
           {fh.hint}
           <br />
@@ -243,7 +273,7 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
               onClick={async () => {
                 setTesting(true); setTestResult("");
                 try {
-                  const r = await api.testLlm(llm.apiFormat, llm.apiKey, llm.model, llm.baseUrl, llm.proxyUrl);
+                  const r = await api.testLlm(llm.apiFormat, llm.apiKey, llm.model, llm.baseUrl, llm.proxyUrl, llm.userAgent);
                   setTestResult(r);
                 } catch (e: any) { setTestResult("错误：" + e.toString()); }
                 finally { setTesting(false); }

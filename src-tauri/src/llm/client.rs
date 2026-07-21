@@ -338,6 +338,24 @@ pub struct LlmConfig {
     pub accept_invalid_certs: bool,
     #[serde(default)]
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+/// Parse a user-supplied User-Agent into a HeaderValue, rejecting empty or
+/// invalid (non-visible-ASCII) values so a bad UA can't fail the client build.
+pub fn parse_user_agent(ua: &Option<String>) -> Option<reqwest::header::HeaderValue> {
+    let trimmed = ua.as_deref()?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match reqwest::header::HeaderValue::from_str(trimmed) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!("[LlmClient] Invalid User-Agent (non-ASCII or control chars), ignored: {}", trimmed);
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +461,11 @@ impl LlmClient {
             } else {
                 eprintln!("[LlmClient] Failed to parse proxy URL: {}", proxy_url);
             }
+        }
+
+        if let Some(ua) = parse_user_agent(&config.user_agent) {
+            eprintln!("[LlmClient] Using custom User-Agent: {:?}", ua);
+            builder = builder.user_agent(ua);
         }
 
         Self {

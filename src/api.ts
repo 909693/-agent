@@ -18,6 +18,7 @@ export interface LlmParams {
   model: string;
   baseUrl: string;
   proxyUrl?: string;  // Optional proxy URL (e.g., "http://127.0.0.1:7897")
+  userAgent?: string; // Optional User-Agent to mimic a specific client (e.g., Claude Code / Codex)
 }
 
 export interface SkillRecord {
@@ -294,17 +295,17 @@ async function cancellableInvoke<T>(key: string, cmd: string, args?: Record<stri
 }
 
 function llmArgs(llm: LlmParams) {
-  return { apiFormat: llm.apiFormat, apiKey: llm.apiKey, model: llm.model, baseUrl: llm.baseUrl, proxyUrl: llm.proxyUrl };
+  return { apiFormat: llm.apiFormat, apiKey: llm.apiKey, model: llm.model, baseUrl: llm.baseUrl, proxyUrl: llm.proxyUrl, userAgent: llm.userAgent };
 }
 
 export const api = {
   getDataDir: () => invoke<string>("get_data_dir"),
   setDataDir: (newDir: string, migrate: boolean) =>
     invoke<string>("set_data_dir", { newDir, migrate }),
-  testLlm: (apiFormat: string, apiKey: string, model: string, baseUrl: string, proxyUrl?: string) =>
-    invoke<string>("test_llm", { apiFormat, apiKey, model, baseUrl, proxyUrl }),
-  fetchModels: (apiFormat: string, apiKey: string, baseUrl: string, proxyUrl?: string) =>
-    invoke<string[]>("fetch_models", { apiFormat, apiKey, baseUrl, proxyUrl }),
+  testLlm: (apiFormat: string, apiKey: string, model: string, baseUrl: string, proxyUrl?: string, userAgent?: string) =>
+    invoke<string>("test_llm", { apiFormat, apiKey, model, baseUrl, proxyUrl, userAgent }),
+  fetchModels: (apiFormat: string, apiKey: string, baseUrl: string, proxyUrl?: string, userAgent?: string) =>
+    invoke<string[]>("fetch_models", { apiFormat, apiKey, baseUrl, proxyUrl, userAgent }),
 
   saveLlmConfig: (config: LlmParams) => invoke("save_llm_config", { config }),
   getLlmConfig: () => invoke<LlmParams | null>("get_llm_config"),

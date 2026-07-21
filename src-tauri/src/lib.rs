@@ -438,10 +438,11 @@ fn get_llm_profiles() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn test_llm(api_format: String, api_key: String, model: String, base_url: String, proxy_url: Option<String>) -> Result<String, String> {
+async fn test_llm(api_format: String, api_key: String, model: String, base_url: String, proxy_url: Option<String>, user_agent: Option<String>) -> Result<String, String> {
     // Validate base_url to prevent SSRF
     validate_base_url(&base_url)?;
 
+    let ua = llm::client::parse_user_agent(&user_agent);
     let model_name = if model.is_empty() { "claude-sonnet-4-20250514".to_string() } else { model };
 
     match api_format.as_str() {
@@ -462,6 +463,9 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
                 if let Ok(p) = reqwest::Proxy::all(proxy) {
                     builder1 = builder1.proxy(p);
                 }
+            }
+            if let Some(ref v) = ua {
+                builder1 = builder1.user_agent(v.clone());
             }
             let r1 = builder1.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
@@ -487,6 +491,9 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
                 if let Ok(p) = reqwest::Proxy::all(proxy) {
                     builder2 = builder2.proxy(p);
                 }
+            }
+            if let Some(ref v) = ua {
+                builder2 = builder2.user_agent(v.clone());
             }
             let r2 = builder2.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
@@ -521,6 +528,9 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
                 if let Ok(p) = reqwest::Proxy::all(proxy) {
                     builder = builder.proxy(p);
                 }
+            }
+            if let Some(ref v) = ua {
+                builder = builder.user_agent(v.clone());
             }
             let resp = builder.build().map_err(|e| format!("Client build: {:?}", e))?
                 .post(&url)
@@ -579,6 +589,7 @@ async fn fetch_models(
     api_key: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Vec<String>, String> {
     // Validate base_url to prevent SSRF
     validate_base_url(&base_url)?;
@@ -590,6 +601,9 @@ async fn fetch_models(
         if let Ok(p) = reqwest::Proxy::all(proxy) {
             builder = builder.proxy(p);
         }
+    }
+    if let Some(v) = llm::client::parse_user_agent(&user_agent) {
+        builder = builder.user_agent(v);
     }
     let client = builder.build().map_err(|e| format!("Client build: {:?}", e))?;
 
@@ -681,6 +695,7 @@ async fn agent_chat(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Input validation
     if message.len() > 10000 {
@@ -762,7 +777,7 @@ async fn agent_chat(
 - action 字段必须严格使用动作类型列表中的 type 值，不要自创类型"#
     );
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let mut msgs = history.clone();
     msgs.push(("user".to_string(), message));
 
@@ -837,6 +852,7 @@ async fn agent_chat_stream(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<(), String> {
     use llm::client::{AgentMsg, StreamEvent};
     use engine::tools;
@@ -880,7 +896,7 @@ async fn agent_chat_stream(
 - 尽量减少不必要的工具调用，能一步完成的不要分多步"#
     );
 
-    let client = std::sync::Arc::new(make_client(&api_format, &api_key, &model, &base_url, proxy_url));
+    let client = std::sync::Arc::new(make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent));
     let tool_defs = tools::get_tool_definitions();
 
     // Build conversation from history + new message
@@ -1098,6 +1114,7 @@ async fn chat_with_ai(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<String, String> {
     // Input validation
     if messages.len() > 100 {
@@ -1107,7 +1124,7 @@ async fn chat_with_ai(
         return Err("类型名称过长".into());
     }
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let constraints_raw = build_constraints_text(constraints.as_ref());
     let constraints_text = truncate_chars(&constraints_raw, 2000);
     let system = format!(
@@ -1152,8 +1169,9 @@ async fn extract_framework(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let system = format!("你是一位专业的小说策划师。请根据之前的对话内容，提取并整理出完整的小说框架。输出严格的 JSON 格式。\n\n{}", constraints_text);
     let mut msgs = messages.clone();
@@ -1336,7 +1354,7 @@ async fn get_mcp_logs(server_id: String) -> Result<String, String> {
     plugins::get_mcp_logs(server_id)
 }
 
-fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, proxy_url: Option<String>) -> LlmClient {
+fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, proxy_url: Option<String>, user_agent: Option<String>) -> LlmClient {
     let default_model = match api_format {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
@@ -1353,6 +1371,7 @@ fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, pro
         },
         base_url: base_url.to_string(),
         proxy_url,
+        user_agent,
         accept_invalid_certs: false, // Default to secure mode
     })
 }
@@ -1366,10 +1385,11 @@ async fn generate_world(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let premise = meta["premise"].as_str().unwrap_or("");
     let genre = meta["genre"].as_str().unwrap_or("");
@@ -1427,11 +1447,12 @@ async fn generate_characters(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let world = storage::load_json(&project_id, "world.json")?.ok_or("Generate world first")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let constraints_text = build_constraints_text(constraints.as_ref());
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "overview": world["overview"],
@@ -1665,6 +1686,7 @@ async fn generate_plot(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     eprintln!("[generate_plot] proxy_url = {:?}", proxy_url);
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
@@ -1672,7 +1694,7 @@ async fn generate_plot(
     let chars =
         storage::load_json(&project_id, "characters.json")?.ok_or("Generate characters first")?;
     let outline_source = storage::load_json(&project_id, "outline_source.json")?.unwrap_or(json!({}));
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url.clone());
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url.clone(), user_agent.clone());
     let constraints_text = build_constraints_text(constraints.as_ref());
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "overview": world["overview"]
@@ -1728,10 +1750,11 @@ async fn generate_timeline(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let world = storage::load_json(&project_id, "world.json")?.ok_or("Generate world first")?;
     let plot = storage::load_json(&project_id, "plot.json")?.ok_or("Generate plot first")?;
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let plot_summary = serde_json::to_string(&plot["acts"]).unwrap_or_default();
     let world_summary = serde_json::to_string(&json!({
         "era": world["era"], "history": world["history"]
@@ -1760,6 +1783,7 @@ async fn expand_chapter(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Input validation
     if chapter_number == 0 || chapter_number > 9999 {
@@ -1782,7 +1806,7 @@ async fn expand_chapter(
     }
     let constraints_text = build_constraints_text(constraints.as_ref());
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let result = engine::expand_chapter(
         &client,
         &format!("{}\n\n{}", truncate_chars(&constraints_text, 2000), chapter_outline),
@@ -1820,6 +1844,7 @@ async fn continue_writing(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Input validation
     if chapter_number == 0 || chapter_number > 9999 {
@@ -1844,7 +1869,7 @@ async fn continue_writing(
         }
     }
     let constraints_text = build_constraints_text(constraints.as_ref());
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     // Truncate existing text to last ~2000 characters to avoid token overflow
     let existing_tail = {
         let chars_count = existing_text.chars().count();
@@ -2000,6 +2025,7 @@ async fn rewrite_selection(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Input validation
     if chapter_number == 0 || chapter_number > 9999 {
@@ -2027,7 +2053,7 @@ async fn rewrite_selection(
         truncate_chars(&raw, 3000).to_string()
     };
     let constraints_text = build_constraints_text(constraints.as_ref());
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     // Truncate selected_text to prevent overflow
     let selected_truncated = truncate_chars(&selected_text, 3000);
     let system = "你是一位专业小说编辑。你的任务是只重写用户选中的局部片段，在保持上下文一致的前提下进行补写增强。只输出 JSON。";
@@ -2054,8 +2080,9 @@ async fn summarize_chapter(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     auto_summarize_and_save(&client, &project_id, chapter_number).await
 }
 
@@ -2184,6 +2211,7 @@ async fn review_chapter(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<String, String> {
     let meta = storage::load_json(&project_id, "meta.json")?.ok_or("Project not found")?;
     let genre = meta["genre"].as_str().unwrap_or("未知");
@@ -2240,7 +2268,7 @@ async fn review_chapter(
         constraints_text
     );
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let msgs = vec![("user".to_string(), user)];
     client.chat(system, &msgs, 8192).await
 }
@@ -2281,6 +2309,7 @@ async fn batch_generate_chapters(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<(), String> {
     // Input validation BEFORE acquiring lock
     if start_chapter == 0 || end_chapter == 0 || start_chapter > end_chapter {
@@ -2323,7 +2352,7 @@ async fn batch_generate_chapters(
         let mut total_word_count = 0u32;
         let mut failed_chapters: Vec<u32> = Vec::new();
 
-        let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+        let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
 
         for (idx, chapter_number) in (start_chapter..=end_chapter).enumerate() {
             // Check cancel
@@ -2496,6 +2525,7 @@ async fn check_consistency(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let summaries = storage::load_json(&project_id, "chapter_summaries.json")?.unwrap_or(json!({}));
     if summaries.as_object().map(|o| o.is_empty()).unwrap_or(true) {
@@ -2515,7 +2545,7 @@ async fn check_consistency(
         }).collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     engine::check_consistency(&client, &truncate_chars(&summaries_str, 6000), &world_str, &chars_str).await
 }
 
@@ -2640,10 +2670,11 @@ async fn simulate_reader(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let chapter_outline = find_chapter_outline(&project_id, chapter_number).unwrap_or_default();
     let context = build_rich_context_string(&project_id, chapter_number)?;
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let truncated = truncate_chars(&chapter_text, 8000);
     engine::simulate_reader(&client, truncated, &chapter_outline, &truncate_chars(&context, 2000)).await
 }
@@ -2656,6 +2687,7 @@ async fn analyze_writing_style(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Collect up to 5 written chapters as samples
     let mut samples = Vec::new();
@@ -2674,7 +2706,7 @@ async fn analyze_writing_style(
         return Err("至少需要 3 章已写内容才能分析文风".into());
     }
     let combined = samples.join("\n\n");
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let result = engine::analyze_style(&client, &combined).await?;
 
     // Save style profile
@@ -2697,13 +2729,14 @@ async fn sync_outline_from_chapter(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
     let chapter = storage::load_json(&project_id, &chapter_file)?.ok_or("章节不存在")?;
     let chapter_text = chapter["text"].as_str().unwrap_or("");
     if chapter_text.is_empty() { return Err("章节内容为空".into()); }
 
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     let result = engine::sync_outline(&client, chapter_text, chapter_number).await?;
     let new_summary = result["summary"].as_str().unwrap_or("");
 
@@ -2735,6 +2768,7 @@ async fn generate_names(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
     // Input validation
     if count == 0 || count > 50 {
@@ -2750,7 +2784,7 @@ async fn generate_names(
         world["era"].as_str().unwrap_or(""),
         truncate_chars(world["overview"].as_str().unwrap_or(""), 800),
     );
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     engine::generate_names(&client, &world_summary, &name_type, count).await
 }
 
@@ -2762,8 +2796,9 @@ async fn deep_sensitivity_check(
     model: String,
     base_url: String,
     proxy_url: Option<String>,
+    user_agent: Option<String>,
 ) -> Result<Value, String> {
-    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url);
+    let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
     engine::sensitivity_check(&client, &truncate_chars(&chapter_text, 8000)).await
 }
 
