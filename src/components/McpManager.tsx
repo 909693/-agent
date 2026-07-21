@@ -25,7 +25,7 @@ const asRecord = (v: unknown): Dict => (v && typeof v === "object" ? (v as Dict)
 const getText = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for (const k of keys) { const x = r[k]; if (typeof x === "string") return x; } return ""; };
 const getBool = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for (const k of keys) if (typeof r[k] === "boolean") return r[k] as boolean; return false; };
 const getArray = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for (const k of keys) if (Array.isArray(r[k])) return r[k] as unknown[]; return []; };
-const getError = (e: unknown) => e instanceof Error ? e.message : "操作失败";
+const getError = (e: unknown) => typeof e === "string" && e.trim() ? e : e instanceof Error ? e.message : "操作失败";
 const repoName = (url: string) => url.replace(/\/+$/, "").split("/").filter(Boolean).slice(-1)[0] || "未命名";
 const getList = (v: unknown) => Array.isArray(v) ? v : Array.isArray(asRecord(v).servers) ? (asRecord(v).servers as unknown[]) : Array.isArray(asRecord(v).items) ? (asRecord(v).items as unknown[]) : [];
 const parseArgs = (value: string) => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);

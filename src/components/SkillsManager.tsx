@@ -25,7 +25,7 @@ const asRecord = (v: unknown): Dict => (v && typeof v === "object" ? (v as Dict)
 const getText = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for (const k of keys) { const x = r[k]; if (typeof x === "string" && x.trim()) return x.trim(); } return ""; };
 const getBool = (v: unknown, ...keys: string[]) => { const r = asRecord(v); for (const k of keys) if (typeof r[k] === "boolean") return r[k] as boolean; return false; };
 const getList = (v: unknown) => Array.isArray(v) ? v : Array.isArray(asRecord(v).skills) ? (asRecord(v).skills as unknown[]) : Array.isArray(asRecord(v).items) ? (asRecord(v).items as unknown[]) : [];
-const getError = (e: unknown) => e instanceof Error ? e.message : "操作失败，请稍后重试";
+const getError = (e: unknown) => typeof e === "string" && e.trim() ? e : e instanceof Error ? e.message : "操作失败，请稍后重试";
 const repoName = (url: string) => url.replace(/\/+$/, "").split("/").filter(Boolean).slice(-1)[0] || "未命名技能";
 const formatTime = (value: string) => !value ? "未记录" : Number.isNaN(Date.parse(value)) ? value : new Date(value).toLocaleString("zh-CN");
 const normalizeSkill = (v: unknown): SkillItem => {

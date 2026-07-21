@@ -172,24 +172,27 @@ pub fn git_clone_or_pull(repo_url: &str, install_path: &Path) -> Result<(), Stri
     }
 
     if install_path.join(".git").exists() {
-        run_git(&[
+        let pull = run_git(&[
             "-C",
             install_path.to_string_lossy().as_ref(),
             "pull",
             "--ff-only",
-        ])
-    } else {
-        if install_path.exists() {
-            return Err(format!(
-                "Install path already exists: {}",
-                install_path.display()
-            ));
+        ]);
+        if pull.is_ok() {
+            return Ok(());
         }
-        if let Some(parent) = install_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        run_git(&["clone", "--depth=1", repo_url, install_path.to_string_lossy().as_ref()])
+        // 上游 force-push 或浅克隆导致无法 fast-forward 时，删除本地副本重新克隆。
+        // 安装目录是托管的（不应有本地修改），重克隆是最可靠的更新方式。
+        remove_dir_if_exists(install_path)?;
+    } else if install_path.exists() {
+        // 残缺安装（目录存在但没有 .git）：清掉后重新克隆
+        remove_dir_if_exists(install_path)?;
     }
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    run_git(&["clone", "--depth=1", repo_url, install_path.to_string_lossy().as_ref()])
+        .map_err(|e| format!("git clone 失败: {}", e))
 }
 
 fn run_git(args: &[&str]) -> Result<(), String> {
