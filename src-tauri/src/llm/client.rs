@@ -495,6 +495,15 @@ impl LlmClient {
         format!("{base}/v1/chat/completions")
     }
 
+    fn responses_url(&self) -> String {
+        let base = if self.config.base_url.is_empty() {
+            "https://api.openai.com".to_string()
+        } else {
+            self.config.base_url.trim_end_matches('/').to_string()
+        };
+        format!("{base}/v1/responses")
+    }
+
     fn gemini_url(&self) -> String {
         let base = if self.config.base_url.is_empty() {
             "https://generativelanguage.googleapis.com".to_string()
@@ -522,6 +531,10 @@ impl LlmClient {
                 self.call_openai(system_prompt, user_prompt, max_tokens)
                     .await
             }
+            "openai-responses" => {
+                self.call_openai_responses(system_prompt, user_prompt, max_tokens)
+                    .await
+            }
             "gemini" => {
                 self.call_gemini(system_prompt, user_prompt, max_tokens)
                     .await
@@ -540,6 +553,7 @@ impl LlmClient {
         match self.config.provider.as_str() {
             "anthropic" => self.chat_claude(system_prompt, messages, max_tokens).await,
             "openai" => self.chat_openai(system_prompt, messages, max_tokens).await,
+            "openai-responses" => self.chat_openai_responses(system_prompt, messages, max_tokens).await,
             "gemini" => self.chat_gemini(system_prompt, messages, max_tokens).await,
             other => Err(format!("Unknown provider: {other}")),
         }
@@ -870,6 +884,105 @@ impl LlmClient {
         parse_json_from_text(text)
     }
 
+    // ===== OpenAI Responses 协议（/v1/responses）=====
+    // 部分中转站对 Codex 类客户端强制要求 Responses 协议，不接受 chat/completions。
+
+    /// 从 Responses API 响应中提取全部输出文本
+    fn extract_responses_text(data: &Value) -> Result<String, String> {
+        // 便捷字段（部分实现直接给出聚合文本）
+        if let Some(t) = data["output_text"].as_str() {
+            if !t.is_empty() {
+                return Ok(t.to_string());
+            }
+        }
+        let mut text = String::new();
+        if let Some(output) = data["output"].as_array() {
+            for item in output {
+                if item["type"].as_str() == Some("message") {
+                    if let Some(content) = item["content"].as_array() {
+                        for part in content {
+                            if part["type"].as_str() == Some("output_text") {
+                                if let Some(t) = part["text"].as_str() {
+                                    text.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if text.is_empty() {
+            return Err(format!("No text in Responses API response: {}", truncate_chars_for_preview(&data.to_string(), 400)));
+        }
+        Ok(text)
+    }
+
+    fn warn_responses_truncated(data: &Value) {
+        if data["status"].as_str() == Some("incomplete")
+            && data["incomplete_details"]["reason"].as_str() == Some("max_output_tokens")
+        {
+            eprintln!("[LlmClient] Warning: Responses 输出因 max_output_tokens 截断");
+        }
+    }
+
+    async fn call_openai_responses(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "instructions": system_prompt,
+            "input": [{"role": "user", "content": format!("{user_prompt}\n\nReturn valid JSON.")}],
+            "max_output_tokens": max_tokens,
+            "temperature": 0.3,
+            "stream": false,
+        });
+        let url = self.responses_url();
+        eprintln!("[LlmClient] Calling OpenAI Responses API: {}", url);
+        eprintln!("[LlmClient] Model: {}, max_output_tokens: {}", self.config.model, max_tokens);
+
+        let (ok, data) = self.post_json_retry(&url, &[
+            ("Authorization", format!("Bearer {}", self.config.api_key)),
+        ], &body).await?;
+        if !ok {
+            return Err(format!("OpenAI Responses API error: {}", data));
+        }
+        Self::warn_responses_truncated(&data);
+        let text = Self::extract_responses_text(&data)?;
+        parse_json_from_text(&text)
+    }
+
+    async fn chat_openai_responses(
+        &self,
+        system_prompt: &str,
+        messages: &[(String, String)],
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        let input: Vec<Value> = messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "instructions": system_prompt,
+            "input": input,
+            "max_output_tokens": max_tokens,
+            "temperature": 0.7,
+            "stream": false,
+        });
+        let url = self.responses_url();
+        let (ok, data) = self.post_json_retry(&url, &[
+            ("Authorization", format!("Bearer {}", self.config.api_key)),
+        ], &body).await?;
+        if !ok {
+            return Err(format!("OpenAI Responses API error: {}", data));
+        }
+        Self::warn_responses_truncated(&data);
+        Self::extract_responses_text(&data)
+    }
+
     // ===== Agent streaming methods =====
 
     fn tools_to_anthropic(tools: &[ToolDef]) -> Vec<Value> {
@@ -1050,6 +1163,7 @@ impl LlmClient {
         match self.config.provider.as_str() {
             "anthropic" => self.stream_anthropic(system, messages, tools, max_tokens, on_token).await,
             "openai" => self.stream_openai(system, messages, tools, max_tokens, on_token).await,
+            "openai-responses" => self.stream_openai_responses(system, messages, tools, max_tokens, on_token).await,
             "gemini" => self.stream_gemini(system, messages, tools, max_tokens, on_token).await,
             other => Err(format!("Unknown provider: {}", other)),
         }
@@ -1379,6 +1493,213 @@ impl LlmClient {
             ToolUseBlock { id, name, input }
         }).collect();
 
+        Ok(AgentResponse { text: full_text, tool_uses, stop_reason })
+    }
+
+    /// Responses 协议的工具定义是扁平结构（不像 chat/completions 嵌套在 function 下）
+    fn tools_to_responses(tools: &[ToolDef]) -> Vec<Value> {
+        tools.iter().map(|t| serde_json::json!({
+            "type": "function",
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
+        })).collect()
+    }
+
+    fn build_responses_input(msgs: &[AgentMsg]) -> Vec<Value> {
+        let mut result: Vec<Value> = Vec::new();
+        for msg in msgs {
+            match msg {
+                AgentMsg::User { content } => {
+                    result.push(serde_json::json!({"role": "user", "content": content}));
+                }
+                AgentMsg::Assistant { text, tool_uses } => {
+                    if !text.is_empty() {
+                        result.push(serde_json::json!({"role": "assistant", "content": text}));
+                    }
+                    for tu in tool_uses {
+                        result.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tu.id,
+                            "name": tu.name,
+                            "arguments": serde_json::to_string(&tu.input).unwrap_or_default(),
+                        }));
+                    }
+                }
+                AgentMsg::ToolResultMsg { tool_use_id, content } => {
+                    result.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": content,
+                    }));
+                }
+            }
+        }
+        result
+    }
+
+    async fn stream_openai_responses(
+        &self,
+        system: &str,
+        messages: &[AgentMsg],
+        tools: &[ToolDef],
+        max_tokens: u32,
+        on_token: impl Fn(&str) + Send + Sync,
+    ) -> Result<AgentResponse, String> {
+        let input = Self::build_responses_input(messages);
+        let tool_defs = Self::tools_to_responses(tools);
+        let url = self.responses_url();
+        let mut last_error = String::new();
+        let mut drop_tools = false;
+        let max_attempts = 4u32;
+
+        for attempt in 0..max_attempts {
+            let use_tools = !drop_tools;
+            let mut body = serde_json::json!({
+                "model": self.config.model,
+                "instructions": system,
+                "input": input,
+                "max_output_tokens": max_tokens,
+                "temperature": 0.7,
+                "stream": true,
+            });
+            if use_tools && !tool_defs.is_empty() {
+                body["tools"] = Value::Array(tool_defs.clone());
+            }
+
+            let resp = match self.http.post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send().await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_connection_error(&e) && attempt + 1 < max_attempts {
+                        let delay = exponential_backoff(attempt);
+                        eprintln!("[Agent/Responses] 连接错误 (attempt {}), {}ms 后重试: {}", attempt + 1, delay.as_millis(), e);
+                        sleep(delay).await;
+                        continue;
+                    }
+                    return Err(format!("OpenAI Responses request failed: {}", e));
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status_code = resp.status().as_u16();
+                let headers = resp.headers().clone();
+                let body_text = resp.text().await.unwrap_or_default();
+
+                if status_code == 524 && !drop_tools && !tool_defs.is_empty() {
+                    eprintln!("[Agent/Responses] 524 timeout with tools, retrying without tools...");
+                    drop_tools = true;
+                    continue;
+                }
+
+                if should_retry(status_code) && attempt + 1 < max_attempts {
+                    let delay = retry_delay(status_code, &headers, attempt);
+                    eprintln!("[Agent/Responses] HTTP {} (attempt {}), {}ms 后重试", status_code, attempt + 1, delay.as_millis());
+                    last_error = format!("HTTP {}: {}", status_code, truncate_chars_for_preview(&body_text, 200));
+                    sleep(delay).await;
+                    continue;
+                }
+
+                return Err(format!("OpenAI Responses API error ({}): {}", status_code, truncate_chars_for_preview(&body_text, 300)));
+            }
+
+            return self.process_responses_sse(resp, &on_token).await;
+        }
+        Err(format!("OpenAI Responses API: 重试耗尽 - {}", last_error))
+    }
+
+    async fn process_responses_sse(
+        &self,
+        resp: Response,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<AgentResponse, String> {
+        let mut full_text = String::new();
+        let mut tool_uses: Vec<ToolUseBlock> = Vec::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
+        let mut stop_reason: Option<String> = None;
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
+            byte_buf.extend_from_slice(&bytes);
+            if byte_buf.len() > 64 * 1024 * 1024 {
+                return Err("流响应过大（超过 64MB），已中止".to_string());
+            }
+
+            while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=newline_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
+
+                if line.is_empty() || line == "data: [DONE]" || line.starts_with("event:") || line.starts_with(':') {
+                    continue;
+                }
+                let json_str = if let Some(pos) = line.find("data:") {
+                    let after = line[pos + 5..].trim();
+                    if after.starts_with('{') { after.to_string() } else { continue; }
+                } else { continue; };
+
+                let chunk: Value = match serde_json::from_str(&json_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                match chunk["type"].as_str().unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(t) = chunk["delta"].as_str() {
+                            full_text.push_str(t);
+                            on_token(t);
+                        }
+                    }
+                    // 完整的 function_call 在 output_item.done 中给出（无需拼接 arguments delta）
+                    "response.output_item.done" => {
+                        let item = &chunk["item"];
+                        if item["type"].as_str() == Some("function_call") {
+                            let args = item["arguments"].as_str().unwrap_or("{}");
+                            let input: Value = serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+                            let id = item["call_id"].as_str()
+                                .or_else(|| item["id"].as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            tool_uses.push(ToolUseBlock {
+                                id,
+                                name: item["name"].as_str().unwrap_or("").to_string(),
+                                input,
+                            });
+                        }
+                    }
+                    "response.completed" | "response.incomplete" => {
+                        let response = &chunk["response"];
+                        if response["incomplete_details"]["reason"].as_str() == Some("max_output_tokens") {
+                            stop_reason = Some("max_tokens".to_string());
+                        }
+                        // 流式 delta 丢失时兜底：从最终响应取文本
+                        if full_text.is_empty() {
+                            if let Ok(t) = Self::extract_responses_text(response) {
+                                on_token(&t);
+                                full_text = t;
+                            }
+                        }
+                    }
+                    "response.failed" => {
+                        let err = &chunk["response"]["error"];
+                        return Err(format!("Responses stream failed: {}", err));
+                    }
+                    "error" => {
+                        return Err(format!("Responses stream error: {}", chunk));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if stop_reason.is_none() && !tool_uses.is_empty() {
+            stop_reason = Some("tool_use".to_string());
+        }
         Ok(AgentResponse { text: full_text, tool_uses, stop_reason })
     }
 

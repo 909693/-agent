@@ -102,6 +102,11 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
       modelPlaceholder: "gpt-5.4 / gpt-4o / claude-sonnet-4-...",
       hint: "OpenAI 兼容中转站：填中转站地址，路径自动拼 /v1/chat/completions",
     },
+    "openai-responses": {
+      urlPlaceholder: "https://welfare.0xpsyche.me",
+      modelPlaceholder: "gpt-5.4 / glm-5.1 / ...",
+      hint: "OpenAI Responses 协议：路径自动拼 /v1/responses，适用于要求 Codex 客户端走 Responses 协议的中转站",
+    },
     anthropic: {
       urlPlaceholder: "https://pay.kxaug.xyz",
       modelPlaceholder: "claude-sonnet-4-20250514 / claude-3-5-sonnet-...",
@@ -146,6 +151,7 @@ export function SettingsPage({ llm, onChange, theme, onThemeChange }: Props) {
           <label>API 格式</label>
           <select value={llm.apiFormat} onChange={e => handleFormatChange(e.target.value)}>
             <option value="openai">OpenAI 兼容</option>
+            <option value="openai-responses">OpenAI Responses</option>
             <option value="anthropic">Anthropic 原生</option>
             <option value="gemini">Gemini 原生</option>
           </select>

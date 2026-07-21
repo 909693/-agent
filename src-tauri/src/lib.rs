@@ -515,6 +515,34 @@ async fn test_llm(api_format: String, api_key: String, model: String, base_url: 
             Ok(format!("URL: {}\nBody: {}\n\n--- x-api-key ---\nStatus: {}\n{}\n\n--- Bearer ---\nStatus: {}\n{}",
                 url, body_str, status1, truncate_chars(&text1, 500), status2, truncate_chars(&text2, 500)))
         }
+        "openai-responses" => {
+            let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
+            let body = serde_json::json!({
+                "model": model_name,
+                "max_output_tokens": 50,
+                "input": [{"role": "user", "content": "Say hi"}]
+            });
+            let mut builder = reqwest::Client::builder()
+                .danger_accept_invalid_certs(false)
+                .timeout(Duration::from_secs(60));
+            if let Some(ref proxy) = proxy_url {
+                if let Ok(p) = reqwest::Proxy::all(proxy) {
+                    builder = builder.proxy(p);
+                }
+            }
+            if let Some(ref v) = ua {
+                builder = builder.user_agent(v.clone());
+            }
+            let resp = builder.build().map_err(|e| format!("Client build: {:?}", e))?
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send().await.map_err(|e| format!("Request failed: {:?}", e))?;
+            let status = resp.status().to_string();
+            let text = resp.text().await.unwrap_or_default();
+            Ok(format!("URL: {}\nStatus: {}\nResponse: {}", url, status, truncate_chars(&text, 500)))
+        }
         _ => {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
             let body = serde_json::json!({
