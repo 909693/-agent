@@ -177,33 +177,133 @@ pub fn git_clone_or_pull(repo_url: &str, install_path: &Path) -> Result<(), Stri
             install_path.to_string_lossy().as_ref(),
             "pull",
             "--ff-only",
+            "--quiet",
         ]);
         if pull.is_ok() {
             return Ok(());
         }
-        // 上游 force-push 或浅克隆导致无法 fast-forward 时，删除本地副本重新克隆。
-        // 安装目录是托管的（不应有本地修改），重克隆是最可靠的更新方式。
-        remove_dir_if_exists(install_path)?;
-    } else if install_path.exists() {
+        // 无法 fast-forward（上游 force-push）或网络中断时重新克隆。
+        // 先克隆到临时目录，成功后才替换旧副本——克隆失败时保留原有安装。
+        let tmp = sibling_tmp_path(install_path);
+        let _ = fs::remove_dir_all(&tmp);
+        run_git(&["clone", "--depth=1", "--quiet", repo_url, tmp.to_string_lossy().as_ref()])
+            .map_err(|e| {
+                let _ = fs::remove_dir_all(&tmp);
+                format!("git 更新失败: {}", e)
+            })?;
+        fs::remove_dir_all(install_path).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, install_path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    if install_path.exists() {
         // 残缺安装（目录存在但没有 .git）：清掉后重新克隆
         remove_dir_if_exists(install_path)?;
     }
     if let Some(parent) = install_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    run_git(&["clone", "--depth=1", repo_url, install_path.to_string_lossy().as_ref()])
-        .map_err(|e| format!("git clone 失败: {}", e))
+    run_git(&["clone", "--depth=1", "--quiet", repo_url, install_path.to_string_lossy().as_ref()])
+        .map_err(|e| {
+            // 清理半成品目录，避免下次被当作残缺安装
+            let _ = fs::remove_dir_all(install_path);
+            format!("git clone 失败: {}", e)
+        })
 }
 
+fn sibling_tmp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    path.with_file_name(format!("{}.update-tmp", name))
+}
+
+/// git 不读取 macOS 系统代理，而 GUI 应用也不继承 shell 的 proxy 环境变量，
+/// 会导致打包后的应用内 git 直连仓库直至挂死。
+/// 依次探测：环境变量 → macOS 系统 HTTPS/HTTP 代理（scutil --proxy）。
+fn detect_proxy() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("scutil").arg("--proxy").output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let get = |key: &str| -> Option<String> {
+            text.lines().find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.trim_start().strip_prefix(':'))
+                    .map(|v| v.trim().to_string())
+            })
+        };
+        for (enable, host_key, port_key) in [
+            ("HTTPSEnable", "HTTPSProxy", "HTTPSPort"),
+            ("HTTPEnable", "HTTPProxy", "HTTPPort"),
+        ] {
+            if get(enable).as_deref() == Some("1") {
+                if let (Some(host), Some(port)) = (get(host_key), get(port_key)) {
+                    if !host.is_empty() && !port.is_empty() {
+                        return Some(format!("http://{}:{}", host, port));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+const GIT_TIMEOUT_SECS: u64 = 120;
+
 fn run_git(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut cmd = Command::new("git");
+    if let Some(proxy) = detect_proxy() {
+        cmd.arg("-c").arg(format!("http.proxy={}", proxy));
+        cmd.arg("-c").arg(format!("https.proxy={}", proxy));
+    }
+    let mut child = cmd
         .args(args)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        // 禁止 git 弹出凭据交互（GUI 环境下会永久挂起）
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动 git: {}", e))?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if status.success() {
+                    return Ok(());
+                }
+                let msg = stderr.trim().to_string();
+                return Err(if msg.is_empty() { format!("git 退出码 {:?}", status.code()) } else { msg });
+            }
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(GIT_TIMEOUT_SECS) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "git 操作超时（{}s），请检查网络或代理设置后重试",
+                        GIT_TIMEOUT_SECS
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
 }
 
