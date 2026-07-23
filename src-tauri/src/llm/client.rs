@@ -522,25 +522,54 @@ impl LlmClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<Value, String> {
-        match self.config.provider.as_str() {
+        // Each call_* returns the RAW text plus a truncated flag instead of
+        // parsing internally, so truncation can be recovered here uniformly.
+        let (mut text, truncated) = match self.config.provider.as_str() {
             "anthropic" => {
                 self.call_claude(system_prompt, user_prompt, max_tokens)
-                    .await
+                    .await?
             }
             "openai" => {
                 self.call_openai(system_prompt, user_prompt, max_tokens)
-                    .await
+                    .await?
             }
             "openai-responses" => {
                 self.call_openai_responses(system_prompt, user_prompt, max_tokens)
-                    .await
+                    .await?
             }
             "gemini" => {
                 self.call_gemini(system_prompt, user_prompt, max_tokens)
-                    .await
+                    .await?
             }
-            other => Err(format!("Unknown provider: {other}")),
+            other => return Err(format!("Unknown provider: {other}")),
+        };
+
+        // Truncated output (max_tokens): ask the model to resume from the cut
+        // point and stitch, instead of hoping repair can salvage half the JSON.
+        // Loop ends as soon as the stitched text parses cleanly.
+        if truncated {
+            for round in 1..=3u32 {
+                if parse_json_strict(&text).is_some() {
+                    break; // already complete (some providers over-report truncation)
+                }
+                eprintln!("[LlmClient] JSON 输出被截断（当前 {} 字节），请求续写 {}/3", text.len(), round);
+                let cont = self.chat(system_prompt, &[
+                    ("user".to_string(), user_prompt.to_string()),
+                    ("assistant".to_string(), text.clone()),
+                    ("user".to_string(), "你的 JSON 输出在上面被截断了。请从截断处直接继续输出剩余内容：不要重复任何已输出的字符，不要添加任何解释或 markdown 代码块标记，直接接着写。".to_string()),
+                ], max_tokens).await?;
+                // Strip any fence the model wrapped the continuation in.
+                let cont = cont.trim();
+                let cont = cont.strip_prefix("```json").or_else(|| cont.strip_prefix("```")).unwrap_or(cont);
+                let cont = cont.strip_suffix("```").unwrap_or(cont);
+                if cont.trim().is_empty() {
+                    break;
+                }
+                text.push_str(cont);
+            }
         }
+
+        parse_json_from_text(&text)
     }
 
     /// Multi-turn chat, returns plain text response
@@ -764,7 +793,7 @@ impl LlmClient {
         system_prompt: &str,
         user_prompt: &str,
         max_tokens: u32,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, bool), String> {
         // For JSON generation, strip "-thinking"/"-cc" to maximize output tokens
         let model_name = self.config.model
             .replace("-thinking", "")
@@ -788,18 +817,19 @@ impl LlmClient {
         if !ok {
             return Err(format!("Anthropic API error: {}", data));
         }
-        if data["stop_reason"].as_str() == Some("max_tokens") {
-            eprintln!("[LlmClient] Warning: JSON 响应因 max_tokens 截断，repair 可能丢数据");
+        let truncated = data["stop_reason"].as_str() == Some("max_tokens");
+        if truncated {
+            eprintln!("[LlmClient] JSON 响应因 max_tokens 截断，将自动续写");
         }
         let text = extract_claude_text(&data)?;
-        parse_json_from_text(&text)
+        Ok((text, truncated))
     }
     async fn call_openai(
         &self,
         system_prompt: &str,
         user_prompt: &str,
         max_tokens: u32,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, bool), String> {
         let body = OpenAIRequest {
             model: self.config.model.clone(),
             max_tokens,
@@ -837,10 +867,13 @@ impl LlmClient {
         } else {
             return Err(format!("No text in OpenAI response: {}", data));
         };
-        if data["stop_reason"].as_str() == Some("max_tokens") {
-            eprintln!("[LlmClient] Warning: JSON 响应因 max_tokens 截断，repair 可能丢数据");
+        // SSE 组装路径与直连路径的截断标志位置不同，两处都查
+        let truncated = data["stop_reason"].as_str() == Some("max_tokens")
+            || data["choices"][0]["finish_reason"].as_str() == Some("length");
+        if truncated {
+            eprintln!("[LlmClient] JSON 响应因 max_tokens 截断，将自动续写");
         }
-        parse_json_from_text(&text)
+        Ok((text, truncated))
     }
 
     async fn call_gemini(
@@ -848,7 +881,7 @@ impl LlmClient {
         system_prompt: &str,
         user_prompt: &str,
         max_tokens: u32,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, bool), String> {
         let body = GeminiRequest {
             contents: vec![GeminiContent {
                 role: Some("user".into()),
@@ -881,7 +914,11 @@ impl LlmClient {
         let text = data["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
             .ok_or("No text in Gemini response")?;
-        parse_json_from_text(text)
+        let truncated = data["candidates"][0]["finishReason"].as_str() == Some("MAX_TOKENS");
+        if truncated {
+            eprintln!("[LlmClient] JSON 响应因 max_tokens 截断，将自动续写");
+        }
+        Ok((text.to_string(), truncated))
     }
 
     // ===== OpenAI Responses 协议（/v1/responses）=====
@@ -930,7 +967,7 @@ impl LlmClient {
         system_prompt: &str,
         user_prompt: &str,
         max_tokens: u32,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, bool), String> {
         let body = serde_json::json!({
             "model": self.config.model,
             "instructions": system_prompt,
@@ -950,8 +987,10 @@ impl LlmClient {
             return Err(format!("OpenAI Responses API error: {}", data));
         }
         Self::warn_responses_truncated(&data);
+        let truncated = data["status"].as_str() == Some("incomplete")
+            && data["incomplete_details"]["reason"].as_str() == Some("max_output_tokens");
         let text = Self::extract_responses_text(&data)?;
-        parse_json_from_text(&text)
+        Ok((text, truncated))
     }
 
     async fn chat_openai_responses(
@@ -1882,10 +1921,9 @@ fn extract_claude_text(data: &Value) -> Result<String, String> {
     Err(format!("No text in Claude response: {}", data))
 }
 
-fn parse_json_from_text(text: &str) -> Result<Value, String> {
-    let trimmed = text.trim();
-    // Strip markdown code fences if present
-    let json_str = if trimmed.starts_with("```") {
+/// Strip surrounding markdown code fences (```json ... ```), if present.
+fn strip_json_fences(trimmed: &str) -> &str {
+    if trimmed.starts_with("```") {
         let len = trimmed.len();
         // Content starts after the first newline (skip the ```lang marker line);
         // clamp to len so a fence with no newline (e.g. just "```") can't overflow.
@@ -1899,45 +1937,70 @@ fn parse_json_from_text(text: &str) -> Result<Value, String> {
         }
     } else {
         trimmed
-    };
-    // Also try to find JSON object/array within the text
-    let json_str = json_str.trim();
-    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+    }
+}
+
+/// Strict parse: fence stripping + direct parse + outermost-braces extraction.
+/// NO truncation repair — returns None unless the JSON is actually complete.
+/// Used by the continuation loop to decide whether stitched output is done.
+fn parse_json_strict(text: &str) -> Option<Value> {
+    let json_str = strip_json_fences(text.trim()).trim();
+    if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+        return Some(val);
+    }
+    let obj_start = json_str.find('{')?;
+    let obj_end = json_str.rfind('}')?;
+    if obj_end > obj_start {
+        serde_json::from_str(&json_str[obj_start..=obj_end]).ok()
+    } else {
+        None
+    }
+}
+
+/// Dump the unparseable LLM output to a temp file for diagnosis; returns the path.
+fn dump_parse_failure(text: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("retl_llm_parse_error_{ts}.txt"));
+    match std::fs::write(&path, text) {
+        Ok(_) => path.to_string_lossy().into_owned(),
+        Err(_) => "(写入失败)".to_string(),
+    }
+}
+
+fn parse_json_from_text(text: &str) -> Result<Value, String> {
+    if let Some(val) = parse_json_strict(text) {
         return Ok(val);
     }
-    // Fallback: find first { or [ and last } or ]
+    // Try to repair truncated JSON by closing open brackets
+    let json_str = strip_json_fences(text.trim()).trim();
     if let Some(obj_start) = json_str.find('{') {
-        if let Some(obj_end) = json_str.rfind('}') {
-            if obj_end > obj_start {
-                if let Ok(val) = serde_json::from_str(&json_str[obj_start..=obj_end]) {
-                    return Ok(val);
-                }
-            }
-        }
-        // Try to repair truncated JSON by closing open brackets
         let fragment = &json_str[obj_start..];
         if let Ok(val) = repair_truncated_json(fragment) {
             return Ok(val);
         }
     }
     let preview = truncate_chars_for_preview(text, 500);
-    Err(format!("JSON parse error (len={}): {}", text.len(), preview))
+    let dump = dump_parse_failure(text);
+    Err(format!("JSON parse error (len={}): {}\n\n完整原文已保存到: {}", text.len(), preview, dump))
 }
 
 /// Attempt to repair truncated JSON by walking byte-by-byte with a proper
-/// state machine, then truncating to the last safe position and closing
-/// open containers. Handles escapes inside strings correctly.
+/// state machine, collecting structurally safe positions, then trying to close
+/// open containers at each — newest first, backing off level by level. A single
+/// cut point is not enough: truncation right after an object KEY (`{"a":1,"ti`
+/// or `{"a":1,"title"`) closes to ILLEGAL JSON (`{"a":1,"title"}`); an earlier
+/// boundary drops the dangling key and parses. Handles escapes inside strings.
 fn repair_truncated_json(text: &str) -> Result<Value, String> {
     let bytes = text.as_bytes();
     let mut stack: Vec<u8> = Vec::new(); // open containers: b'{' or b'['
     let mut in_string = false;
     let mut escape = false;
-    // Last byte offset at which the JSON was in a structurally safe state
-    // (not inside a string, not inside a number/literal being read, and with
-    // a non-empty stack so we still have something to close). We resume here
-    // on truncation. A "safe" boundary is right after `,` `[` `{` `:` or
-    // right after a complete value (closing `}` `]` `"`, digit end).
-    let mut safe_end: usize = 0;
+    // Byte offsets at which the JSON was in a structurally safe state (not
+    // inside a string/number, non-empty stack so there's something to close).
+    let mut boundaries: Vec<usize> = Vec::new();
     let mut in_number = false;
     let mut after_value = false; // just closed a string/array/object/number
 
@@ -1950,7 +2013,7 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
             } else if c == b'"' {
                 in_string = false;
                 after_value = true;
-                safe_end = i + 1;
+                if !stack.is_empty() { boundaries.push(i + 1); }
             }
             continue;
         }
@@ -1965,7 +2028,7 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
             } else {
                 in_number = false;
                 after_value = true;
-                safe_end = i; // number ends just before this byte
+                if !stack.is_empty() { boundaries.push(i); } // number ends just before this byte
                 // fall through to handle current byte
             }
         }
@@ -1979,44 +2042,30 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
             b'{' | b'[' => {
                 stack.push(c);
                 after_value = false;
-                if !stack.is_empty() {
-                    safe_end = i + 1;
-                }
+                // NOT a boundary: closing here would emit an empty {}/[] as a
+                // dangling member — better to back off and drop the whole
+                // half-written element at the previous comma instead.
             }
             b'}' => {
                 if stack.last() == Some(&b'{') {
                     stack.pop();
                     after_value = true;
-                    if !stack.is_empty() {
-                        safe_end = i + 1;
-                    }
+                    if !stack.is_empty() { boundaries.push(i + 1); }
                 }
             }
             b']' => {
                 if stack.last() == Some(&b'[') {
                     stack.pop();
                     after_value = true;
-                    if !stack.is_empty() {
-                        safe_end = i + 1;
-                    }
+                    if !stack.is_empty() { boundaries.push(i + 1); }
                 }
             }
-            b',' => {
+            b',' | b':' => {
                 after_value = false;
-                if !stack.is_empty() {
-                    safe_end = i + 1;
-                }
-            }
-            b':' => {
-                after_value = false;
-                if !stack.is_empty() {
-                    safe_end = i + 1;
-                }
+                if !stack.is_empty() { boundaries.push(i + 1); }
             }
             b' ' | b'\t' | b'\n' | b'\r' => {
-                if after_value && !stack.is_empty() {
-                    safe_end = i + 1;
-                }
+                if after_value && !stack.is_empty() { boundaries.push(i + 1); }
             }
             b'0'..=b'9' | b'-' => {
                 in_number = true;
@@ -2025,78 +2074,85 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
             b't' | b'f' | b'n' => {
                 // Literal true/false/null — find its end
                 let end = match c {
-                    b't' | b'f' if bytes.get(i..i + 4) == Some(b"true") => i + 4,
+                    b't' if bytes.get(i..i + 4) == Some(b"true") => i + 4,
                     b'f' if bytes.get(i..i + 5) == Some(b"false") => i + 5,
                     b'n' if bytes.get(i..i + 4) == Some(b"null") => i + 4,
                     _ => i,
                 };
                 if end > i {
                     after_value = true;
-                    safe_end = end;
+                    if !stack.is_empty() { boundaries.push(end); }
                 }
             }
             _ => {}
         }
     }
 
-    // Truncate to last known-safe position, or handle in-string truncation
-    let mut repaired = if safe_end > 0 && safe_end <= text.len() {
-        text[..safe_end].to_string()
-    } else if in_string && !stack.is_empty() {
-        // Truncated inside a string value — close the string and containers
+    // Candidate fragments, best first: if truncation hit inside a string VALUE,
+    // closing the quote keeps the most data; then progressively earlier safe
+    // boundaries (each drops a dangling key / half-written value).
+    let mut candidates: Vec<String> = Vec::new();
+    if in_string && !stack.is_empty() {
         let mut s = text.to_string();
         // Remove trailing incomplete escape sequence
         if s.ends_with('\\') { s.pop(); }
         s.push('"');
-        s
-    } else {
-        text.to_string()
-    };
+        candidates.push(s);
+    }
+    for &end in boundaries.iter().rev().take(30) {
+        if end > 0 && end <= text.len() {
+            candidates.push(text[..end].to_string());
+        }
+    }
+    if candidates.is_empty() && text.starts_with('{') {
+        // Nothing safe at all (e.g. truncated inside the very first key) —
+        // salvage at least an empty object rather than failing outright.
+        candidates.push("{".to_string());
+    }
 
-    // Strip trailing commas/colons/whitespace that would break parsing
-    let trim_trailing = |s: &mut String| {
-        while let Some(c) = s.chars().last() {
+    for mut repaired in candidates {
+        // Strip trailing commas/colons/whitespace that would break parsing
+        while let Some(c) = repaired.chars().last() {
             if c == ',' || c == ':' || c.is_whitespace() {
-                s.pop();
+                repaired.pop();
             } else {
                 break;
             }
         }
-    };
-    trim_trailing(&mut repaired);
 
-    // Recompute stack depth on the truncated string (it may differ from
-    // the full-text walk because we cut off some trailing opens).
-    let mut final_stack: Vec<u8> = Vec::new();
-    let mut s_in_str = false;
-    let mut s_esc = false;
-    for &c in repaired.as_bytes() {
-        if s_in_str {
-            if s_esc { s_esc = false; }
-            else if c == b'\\' { s_esc = true; }
-            else if c == b'"' { s_in_str = false; }
-            continue;
+        // Recompute stack depth on the truncated fragment (it may differ from
+        // the full-text walk because we cut off some trailing opens).
+        let mut final_stack: Vec<u8> = Vec::new();
+        let mut s_in_str = false;
+        let mut s_esc = false;
+        for &c in repaired.as_bytes() {
+            if s_in_str {
+                if s_esc { s_esc = false; }
+                else if c == b'\\' { s_esc = true; }
+                else if c == b'"' { s_in_str = false; }
+                continue;
+            }
+            match c {
+                b'"' => s_in_str = true,
+                b'{' | b'[' => final_stack.push(c),
+                b'}' if final_stack.last() == Some(&b'{') => { final_stack.pop(); }
+                b']' if final_stack.last() == Some(&b'[') => { final_stack.pop(); }
+                _ => {}
+            }
         }
-        match c {
-            b'"' => s_in_str = true,
-            b'{' | b'[' => final_stack.push(c),
-            b'}' if final_stack.last() == Some(&b'{') => { final_stack.pop(); }
-            b']' if final_stack.last() == Some(&b'[') => { final_stack.pop(); }
-            _ => {}
+
+        // Close open containers from innermost outward
+        while let Some(opener) = final_stack.pop() {
+            repaired.push(if opener == b'{' { '}' } else { ']' });
+        }
+
+        if let Ok(val) = serde_json::from_str::<Value>(&repaired) {
+            eprintln!("[LlmClient] JSON repair 成功（保留 {} / {} 字节后闭合）", repaired.len(), text.len());
+            return Ok(val);
         }
     }
 
-    // Close open containers from innermost outward
-    while let Some(opener) = final_stack.pop() {
-        repaired.push(if opener == b'{' { '}' } else { ']' });
-    }
-
-    serde_json::from_str(&repaired).map_err(|e| {
-        format!(
-            "JSON repair failed after truncating to {} bytes: {}",
-            repaired.len(), e
-        )
-    })
+    Err("JSON repair failed: no safe truncation point parses".to_string())
 }
 
 /// Redact secrets that may appear in a URL before logging or surfacing to the UI:
@@ -2143,4 +2199,55 @@ fn truncate_chars_for_preview(s: &str, max_chars: usize) -> String {
     let mut chars = s.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
     format!("{}...[{}+{} chars]", truncated, truncated.chars().count(), s.chars().count() - max_chars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The bug this guards against: truncation right after an object KEY used to
+    // close to illegal JSON ({"a":1,"title"}) and fail; backing off must drop
+    // the dangling key and parse.
+    #[test]
+    fn repair_drops_dangling_key() {
+        let v = repair_truncated_json(r#"{"a":1,"title""#).unwrap();
+        assert_eq!(v["a"], 1);
+        assert!(v.get("title").is_none());
+    }
+
+    #[test]
+    fn repair_drops_key_with_colon() {
+        let v = repair_truncated_json(r#"{"a":1,"title":"#).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn repair_closes_string_value() {
+        let v = repair_truncated_json(r#"{"a":1,"b":"半截"#).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], "半截");
+    }
+
+    #[test]
+    fn repair_truncated_array_of_objects() {
+        let v = repair_truncated_json(r#"{"acts":[{"n":1},{"n":2},{"n"#).unwrap();
+        let acts = v["acts"].as_array().unwrap();
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[1]["n"], 2);
+    }
+
+    #[test]
+    fn repair_mid_key_string() {
+        // Truncated inside the key string itself — in-string closure yields a
+        // dangling key; backoff must drop it.
+        let v = repair_truncated_json(r#"{"a":1,"tit"#).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn strict_parse_rejects_truncated() {
+        assert!(parse_json_strict(r#"{"a":1,"b""#).is_none());
+        assert!(parse_json_strict(r#"{"a":1}"#).is_some());
+        assert!(parse_json_strict("```json\n{\"a\":1}\n```").is_some());
+    }
 }
