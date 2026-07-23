@@ -53,77 +53,87 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Default data directory: <exe_dir>/data/projects/
+/// Standard app data root: ~/Library/Application Support/retl (macOS) or
+/// %LOCALAPPDATA%/retl (Windows). Everything lives here — projects, LLM config,
+/// secrets, extensions — so replacing the .app bundle never touches user data.
+/// (An earlier design kept data next to the executable, portable-style; on macOS
+/// a Finder "replace" of the .app deleted it all. See migrate_portable_data.)
+pub(crate) fn standard_root() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("retl"))
+        .unwrap_or_else(|| exe_dir().join("data"))
+}
+
+/// Default data directory: <standard_root>/projects/
 fn default_data_dir() -> PathBuf {
-    exe_dir().join("data").join("projects")
+    standard_root().join("projects")
 }
 
-/// Config file: <exe_dir>/data/config.json
+/// Config file: <standard_root>/config.json
 fn config_path() -> PathBuf {
-    exe_dir().join("data").join("config.json")
+    standard_root().join("config.json")
 }
 
-/// Legacy data directory (pre-migration): ~/Library/Application Support/retl/ or %LOCALAPPDATA%/retl/
-fn legacy_data_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("retl"))
-}
-
-/// Migrate data from legacy location to new exe-relative location
-fn migrate_legacy_data() {
-    let old_root = match legacy_data_dir() {
-        Some(d) if d.exists() => d,
-        _ => return,
-    };
-    let new_root = exe_dir().join("data");
-
-    // Only migrate if new location is empty/missing and old has content
-    let new_has_data = new_root.join("projects").exists()
-        && fs::read_dir(new_root.join("projects")).map(|mut d| d.next().is_some()).unwrap_or(false);
-    if new_has_data {
+/// One-time recovery migration: earlier versions stored ALL data inside the app
+/// bundle (<exe_dir>/data), which a Finder "replace .app" install wipes. If that
+/// directory still exists, move its contents to the standard root — bundle files
+/// WIN over same-name files at the standard root, because the bundle copy was the
+/// live, most-recently-written data (the standard-root copy, if any, is a stale
+/// pre-portable leftover). Afterwards the bundle dir is renamed to data.migrated
+/// as a belt-and-suspenders backup; if the rename fails the migration simply
+/// re-runs (idempotent overwrite-copy) on next launch.
+fn migrate_portable_data() {
+    let old_root = exe_dir().join("data");
+    if !old_root.exists() {
+        return;
+    }
+    let new_root = standard_root();
+    if new_root == old_root {
+        // dirs::data_local_dir() unavailable — nothing sane to migrate to.
         return;
     }
 
-    eprintln!("[Storage] Migrating legacy data from {:?} to {:?}", old_root, new_root);
+    eprintln!("[Storage] Migrating portable data from {:?} to {:?}", old_root, new_root);
     fs::create_dir_all(&new_root).ok();
+    copy_dir_overwrite(&old_root, &new_root);
 
-    // Copy top-level files (llm_config.json, llm_profiles.json, config.json, etc.)
-    if let Ok(entries) = fs::read_dir(&old_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            if path.is_file() {
-                let dest = new_root.join(&name);
-                if !dest.exists() {
-                    fs::copy(&path, &dest).ok();
-                }
+    // If a custom data_dir points inside the (doomed) bundle dir, drop it so the
+    // app falls back to the standard projects dir where the data now lives.
+    let cfg = new_root.join("config.json");
+    if let Ok(content) = fs::read_to_string(&cfg) {
+        if let Ok(mut val) = serde_json::from_str::<Value>(&content) {
+            let points_into_bundle = val["data_dir"].as_str()
+                .map(|d| PathBuf::from(d).starts_with(&old_root))
+                .unwrap_or(false);
+            if points_into_bundle {
+                val["data_dir"] = Value::String(String::new());
+                let _ = fs::write(&cfg, serde_json::to_string_pretty(&val).unwrap_or_default());
             }
         }
     }
 
-    // Copy projects/ directory recursively
-    let old_projects = old_root.join("projects");
-    if old_projects.exists() {
-        copy_dir_recursive(&old_projects, &new_root.join("projects"));
+    // Keep the bundle copy as a backup under a name that won't re-trigger migration.
+    let backup = exe_dir().join("data.migrated");
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
     }
-
-    // Copy extensions/ directory recursively (skills, mcp)
-    let old_extensions = old_root.join("extensions");
-    if old_extensions.exists() {
-        copy_dir_recursive(&old_extensions, &new_root.join("extensions"));
+    if fs::rename(&old_root, &backup).is_err() {
+        eprintln!("[Storage] Could not rename old data dir (will re-migrate next launch)");
     }
-
-    eprintln!("[Storage] Migration complete");
+    eprintln!("[Storage] Portable data migration complete");
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+/// Recursive copy where src files OVERWRITE dst files (used by the portable→
+/// standard migration, where src is the newer live data).
+fn copy_dir_overwrite(src: &std::path::Path, dst: &std::path::Path) {
     fs::create_dir_all(dst).ok();
     if let Ok(entries) = fs::read_dir(src) {
         for entry in entries.flatten() {
             let src_path = entry.path();
             let dst_path = dst.join(entry.file_name());
             if src_path.is_dir() {
-                copy_dir_recursive(&src_path, &dst_path);
-            } else if !dst_path.exists() {
+                copy_dir_overwrite(&src_path, &dst_path);
+            } else {
                 fs::copy(&src_path, &dst_path).ok();
             }
         }
@@ -132,7 +142,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 
 /// Load custom dir from config on startup
 pub fn init_data_dir() {
-    migrate_legacy_data();
+    migrate_portable_data();
     let cfg = config_path();
     if cfg.exists() {
         if let Ok(content) = fs::read_to_string(&cfg) {
@@ -465,9 +475,9 @@ pub fn swap_snapshots(project_id: &str, a: u32, b: u32) -> Result<(), String> {
 
 // ===== LLM Config (app-level, not per-project) =====
 
-/// Root app data directory: <exe_dir>/data/
+/// Root app data directory (LLM config, secrets): <standard_root>/
 fn app_root_dir() -> PathBuf {
-    let dir = exe_dir().join("data");
+    let dir = standard_root();
     fs::create_dir_all(&dir).ok();
     dir
 }

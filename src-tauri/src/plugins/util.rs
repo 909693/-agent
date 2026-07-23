@@ -42,11 +42,9 @@ fn is_trusted_git_url(repo_url: &str) -> bool {
 }
 
 pub fn app_root() -> PathBuf {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("data");
+    // Shared standard root (~/Library/Application Support/retl) — extensions must
+    // NOT live inside the .app bundle, or a replace-install wipes them.
+    let dir = crate::storage::standard_root();
     fs::create_dir_all(&dir).ok();
     dir
 }
