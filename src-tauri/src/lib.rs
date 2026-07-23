@@ -439,6 +439,19 @@ fn get_llm_profiles() -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn save_llm_providers(data: Value) -> Result<(), String> {
+    storage::save_llm_providers(&data)
+}
+
+#[tauri::command]
+fn get_llm_providers() -> Result<Value, String> {
+    match storage::load_llm_providers()? {
+        Some(val) => Ok(val),
+        None => Ok(json!({ "activeId": "", "providers": [] })),
+    }
+}
+
+#[tauri::command]
 async fn test_llm(api_format: String, api_key: String, model: String, base_url: String, proxy_url: Option<String>, user_agent: Option<String>) -> Result<String, String> {
     // Validate base_url to prevent SSRF
     validate_base_url(&base_url)?;
@@ -3174,6 +3187,8 @@ pub fn run() {
             get_llm_config,
             save_llm_profiles,
             get_llm_profiles,
+            save_llm_providers,
+            get_llm_providers,
             agent_chat,
             agent_chat_stream,
             cancel_agent_chat,

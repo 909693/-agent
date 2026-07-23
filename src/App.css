@@ -2979,3 +2979,178 @@ body {
   .genre-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .chat-msg { max-width: 88%; }
 }
+
+/* ===== 多供应商列表 ===== */
+.provider-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.provider-list-head h3 { margin: 0; }
+
+.provider-empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.provider-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary, transparent);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.provider-item:hover { border-color: var(--text-secondary); }
+.provider-item.active {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary) inset;
+}
+
+.provider-item-main { min-width: 0; flex: 1; }
+
+.provider-item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.provider-name {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text-primary);
+}
+.provider-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.provider-badge.active-badge {
+  background: var(--primary);
+  color: #fff;
+}
+
+.provider-item-sub {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.provider-url {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.provider-model {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.provider-item-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.provider-item-actions .btn-primary,
+.provider-item-actions .btn-outline {
+  font-size: 12px;
+  padding: 5px 12px;
+}
+.btn-outline.danger { color: var(--danger); }
+.btn-outline.danger:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+.provider-edit-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* ===== 模型池(供应商编辑) ===== */
+.model-pool {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-secondary, #f4f4f5);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color .15s, background .15s;
+}
+.model-chip:hover { border-color: var(--text-secondary); }
+.model-chip.current {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+.model-chip-check { font-size: 11px; }
+.model-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  opacity: .6;
+}
+.model-chip-remove:hover { opacity: 1; background: rgba(0,0,0,.15); }
+.model-chip.current .model-chip-remove:hover { background: rgba(255,255,255,.25); }
+.model-list-check {
+  display: inline-block;
+  width: 16px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.model-list-item.active .model-list-check { color: var(--primary); }
+
+/* ===== 顶栏模型选择器 ===== */
+.top-bar-model {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg, #fff);
+  color: var(--text);
+  font-size: 12px;
+  max-width: 220px;
+  cursor: pointer;
+}
+.top-bar-model:hover { border-color: var(--text-secondary); }

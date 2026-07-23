@@ -21,6 +21,25 @@ export interface LlmParams {
   userAgent?: string; // Optional User-Agent to mimic a specific client (e.g., Claude Code / Codex)
 }
 
+// 多供应商:每个 Provider 是完全自包含的一套 LLM 配置(含独立代理/UA)。
+// 选中一个即派生出当前生效的 LlmParams 传给下游。
+export interface LlmProvider {
+  id: string;         // uuid,内部标识
+  name: string;       // 用户自定义显示名
+  apiFormat: string;
+  apiKey: string;
+  model: string;      // 当前选用的模型(从 models 池里选一个)
+  models?: string[];  // 该供应商配置的模型池,可有多个;写作时从中选一个
+  baseUrl: string;
+  proxyUrl?: string;
+  userAgent?: string;
+}
+
+export interface LlmProvidersData {
+  activeId: string;
+  providers: LlmProvider[];
+}
+
 export interface SkillRecord {
   id: string;
   name: string;
@@ -313,6 +332,9 @@ export const api = {
   saveLlmProfiles: (profiles: Record<string, { apiKey: string; model: string; baseUrl: string }>) =>
     invoke("save_llm_profiles", { profiles }),
   getLlmProfiles: () => invoke<Record<string, { apiKey: string; model: string; baseUrl: string }>>("get_llm_profiles"),
+
+  saveLlmProviders: (data: LlmProvidersData) => invoke("save_llm_providers", { data }),
+  getLlmProviders: () => invoke<LlmProvidersData | null>("get_llm_providers"),
 
   createProject: (data: {
     title: string; genre: string; premise: string;

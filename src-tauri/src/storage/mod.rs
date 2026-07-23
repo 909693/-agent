@@ -595,3 +595,187 @@ pub fn load_llm_profiles() -> Result<Option<Value>, String> {
 
     Ok(Some(val))
 }
+
+// ===== 多供应商配置(providers)=====
+//
+// 数据结构:llm_providers.json = { "activeId": "<uuid>", "providers": [ {..} ] }
+// 每个 provider:{ id, name, apiFormat, baseUrl, model, proxyUrl?, userAgent? }
+// apiKey 不写进 JSON,单独存 .secrets.json(键 = provider id)。
+//
+// 这是「按格式存一套」(llm_profiles.json)的升级:允许任意多个具名供应商。
+
+fn providers_path() -> PathBuf {
+    app_root_dir().join("llm_providers.json")
+}
+
+/// 保存 providers 列表(原子写)。apiKey 抽出存 .secrets.json,JSON 里不落明文。
+pub fn save_llm_providers(data: &Value) -> Result<(), String> {
+    let dir = app_root_dir();
+    let path = providers_path();
+
+    let mut stripped = data.clone();
+    let mut valid_ids: Vec<String> = Vec::new();
+
+    if let Some(arr) = stripped.get_mut("providers").and_then(|v| v.as_array_mut()) {
+        for p in arr.iter_mut() {
+            if let Some(obj) = p.as_object_mut() {
+                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                // 存 key 到 .secrets.json(占位符 / 空则跳过,保留已有 key)
+                if let Some(api_key) = obj.get("apiKey").and_then(|v| v.as_str()) {
+                    if !api_key.is_empty() && api_key != "***STORED_IN_KEYCHAIN***" {
+                        keyring::store_api_key(&id, api_key)?;
+                    }
+                }
+                obj.remove("apiKey");
+                valid_ids.push(id);
+            }
+        }
+    }
+
+    // 清理被删除供应商的孤儿 key
+    keyring::prune_keys(&valid_ids)?;
+
+    let content = serde_json::to_string_pretty(&stripped).map_err(|e| e.to_string())?;
+    let tmp_path = dir.join(".llm_providers.json.tmp");
+    fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("重命名文件失败: {}", e)
+    })
+}
+
+/// 读取 providers 列表,并从 .secrets.json 回填各 provider 的 apiKey。
+/// 若 llm_providers.json 不存在,尝试从旧配置(llm_config/llm_profiles)迁移一次。
+pub fn load_llm_providers() -> Result<Option<Value>, String> {
+    let path = providers_path();
+    if !path.exists() {
+        // 首次:从旧配置迁移
+        if let Some(migrated) = migrate_to_providers()? {
+            return Ok(Some(migrated));
+        }
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut val: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    if let Some(arr) = val.get_mut("providers").and_then(|v| v.as_array_mut()) {
+        for p in arr.iter_mut() {
+            if let Some(obj) = p.as_object_mut() {
+                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let api_key = keyring::get_api_key(&id).ok().flatten().unwrap_or_default();
+                obj.insert("apiKey".to_string(), serde_json::json!(api_key));
+            }
+        }
+    }
+
+    Ok(Some(val))
+}
+
+/// 一次性迁移:旧 llm_config.json(当前生效)+ llm_profiles.json(每格式一套)
+/// → providers 列表。当前生效配置设为 active。写入 llm_providers.json 后返回。
+/// 无任何旧配置则返回 None。
+fn migrate_to_providers() -> Result<Option<Value>, String> {
+    let mut providers: Vec<Value> = Vec::new();
+    let mut active_id = String::new();
+
+    // 1) 当前生效配置(llm_config.json)→ 第一个供应商,设为 active
+    if let Ok(Some(cfg)) = load_llm_config() {
+        let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let model = cfg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let api_format = cfg.get("apiFormat").and_then(|v| v.as_str()).unwrap_or("openai");
+        let api_key = cfg.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+        // 有意义才迁移(至少填过 url 或 model)
+        if !base_url.is_empty() || !model.is_empty() {
+            let id = uuid_v4();
+            active_id = id.clone();
+            if !api_key.is_empty() {
+                let _ = keyring::store_api_key(&id, api_key);
+            }
+            providers.push(serde_json::json!({
+                "id": id,
+                "name": provider_display_name(api_format, base_url),
+                "apiFormat": api_format,
+                "baseUrl": base_url,
+                "model": model,
+                "proxyUrl": cfg.get("proxyUrl").and_then(|v| v.as_str()).unwrap_or(""),
+                "userAgent": cfg.get("userAgent").and_then(|v| v.as_str()).unwrap_or(""),
+            }));
+        }
+    }
+
+    // 2) llm_profiles.json 里与当前生效不同的其它套 → 追加为供应商
+    if let Ok(Some(profiles)) = load_llm_profiles() {
+        if let Some(obj) = profiles.as_object() {
+            for (format_name, profile) in obj.iter() {
+                let base_url = profile.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+                let model = profile.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let api_key = profile.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+                if base_url.is_empty() && model.is_empty() {
+                    continue;
+                }
+                // 跳过与已迁移的当前配置完全相同的(format+url+model)
+                let dup = providers.iter().any(|p| {
+                    p.get("apiFormat").and_then(|v| v.as_str()) == Some(format_name.as_str())
+                        && p.get("baseUrl").and_then(|v| v.as_str()) == Some(base_url)
+                        && p.get("model").and_then(|v| v.as_str()) == Some(model)
+                });
+                if dup {
+                    continue;
+                }
+                let id = uuid_v4();
+                if !api_key.is_empty() {
+                    let _ = keyring::store_api_key(&id, api_key);
+                }
+                providers.push(serde_json::json!({
+                    "id": id,
+                    "name": provider_display_name(format_name, base_url),
+                    "apiFormat": format_name,
+                    "baseUrl": base_url,
+                    "model": model,
+                    "proxyUrl": "",
+                    "userAgent": "",
+                }));
+            }
+        }
+    }
+
+    if providers.is_empty() {
+        return Ok(None);
+    }
+    if active_id.is_empty() {
+        active_id = providers[0].get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    }
+
+    let result = serde_json::json!({ "activeId": active_id, "providers": providers });
+    // 落盘(save 会再次抽 key,但 key 已在 .secrets.json,占位/空跳过,无副作用)
+    save_llm_providers(&result)?;
+    // 回填 key 后返回给前端
+    load_llm_providers()
+}
+
+/// 由格式 + URL 生成一个可读的默认供应商名(如 "anthropic · api.example.com")。
+fn provider_display_name(api_format: &str, base_url: &str) -> String {
+    let host = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        api_format.to_string()
+    } else {
+        format!("{} · {}", api_format, host)
+    }
+}
+
+/// 生成新 provider id。复用 crate 已有的 uuid 依赖。
+fn uuid_v4() -> String {
+    uuid::Uuid::new_v4().to_string()
+}

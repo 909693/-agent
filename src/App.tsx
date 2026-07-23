@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, type ProjectMeta, type LlmParams } from "./api";
+import { api, type ProjectMeta, type LlmParams, type LlmProvider } from "./api";
 import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./components/Dashboard";
 import { NovelList } from "./components/NovelList";
@@ -43,24 +43,18 @@ function App() {
     frameworkReady: false,
     error: "",
   });
-  const [llm, setLlm] = useState<LlmParams>({
-    apiFormat: "openai",
-    apiKey: "",
-    model: "",
-    baseUrl: "",
-  });
+  // 多供应商:providers 列表 + 当前启用 id。派生出当前生效的 llm 传给下游(下游零改动)。
+  const [providers, setProviders] = useState<LlmProvider[]>([]);
+  const [activeId, setActiveId] = useState<string>("");
   const [llmLoaded, setLlmLoaded] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("retl_theme") || "light");
 
-  // Load LLM config from backend on mount
+  // Load providers from backend on mount (后端会自动迁移旧配置)
   useEffect(() => {
-    api.getLlmConfig().then((config) => {
-      if (config && typeof config === "object") {
-        // Always load config, even if apiKey is empty (keychain might have failed)
-        setLlm(prev => ({
-          ...prev,
-          ...config,
-        }));
+    api.getLlmProviders().then((data) => {
+      if (data && Array.isArray(data.providers)) {
+        setProviders(data.providers);
+        setActiveId(data.activeId || (data.providers[0]?.id ?? ""));
       }
       setLlmLoaded(true);
     }).catch(() => {
@@ -77,15 +71,37 @@ function App() {
     api.listProjects().then(setProjects).catch(console.error);
   }, []);
 
-  // Save LLM config to backend when it changes (debounced, skip initial empty state)
+  // Persist providers to backend when they change (debounced, skip initial load)
   useEffect(() => {
     if (!llmLoaded) return;
     const timer = setTimeout(() => {
-      api.saveLlmConfig(llm).catch(() => {});
+      api.saveLlmProviders({ activeId, providers }).catch(() => {});
     }, 1000);
     return () => clearTimeout(timer);
-  }, [llm, llmLoaded]);
+  }, [providers, activeId, llmLoaded]);
+
+  // 派生出当前生效的 LlmParams(供下游组件消费,接口不变)
+  const activeProvider = providers.find(p => p.id === activeId);
+  const llm: LlmParams = {
+    apiFormat: activeProvider?.apiFormat ?? "openai",
+    apiKey: activeProvider?.apiKey ?? "",
+    model: activeProvider?.model ?? "",
+    baseUrl: activeProvider?.baseUrl ?? "",
+    proxyUrl: activeProvider?.proxyUrl,
+    userAgent: activeProvider?.userAgent,
+  };
   const isApiConfigured = !!(llm.apiKey && llm.model);
+
+  // 当前供应商的模型池(去重;确保当前 model 也在列表里)
+  const activeModels: string[] = activeProvider
+    ? Array.from(new Set([...(activeProvider.models ?? []), ...(activeProvider.model ? [activeProvider.model] : [])]))
+    : [];
+
+  // 切换当前供应商正在使用的模型
+  const handleSelectModel = (model: string) => {
+    if (!activeProvider) return;
+    setProviders(prev => prev.map(p => (p.id === activeProvider.id ? { ...p, model } : p)));
+  };
 
   const handleNewProject = () => {
     setShowCreateDialog(true);
@@ -170,6 +186,18 @@ function App() {
         <div className="top-bar">
           <span className="top-bar-title">{pageTitle[page]}</span>
           <div className="top-bar-right">
+            {activeProvider && activeModels.length > 0 && (
+              <select
+                className="model-picker"
+                value={llm.model}
+                onChange={e => handleSelectModel(e.target.value)}
+                title={`当前供应商：${activeProvider.name}`}
+              >
+                {activeModels.map(m => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            )}
             <span
               className={`api-badge ${isApiConfigured ? "configured" : "not-configured"}`}
               onClick={isApiConfigured ? undefined : () => setPage("settings")}
@@ -227,7 +255,14 @@ function App() {
               />
             )}
             {page === "settings" && (
-              <SettingsPage llm={llm} onChange={setLlm} theme={theme} onThemeChange={setTheme} />
+              <SettingsPage
+                providers={providers}
+                activeId={activeId}
+                onProvidersChange={setProviders}
+                onActiveChange={setActiveId}
+                theme={theme}
+                onThemeChange={setTheme}
+              />
             )}
             {page === "chat" && (
               <ChatCreator
