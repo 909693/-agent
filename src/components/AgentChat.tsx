@@ -159,7 +159,20 @@ export function AgentChat({ projectId, genre, llm, messages, onMessagesChange, o
             break;
           }
           case "error": {
-            updateMessages(prev => [...prev, { role: "assistant", content: `出错了：${data.error}` }]);
+            const isCancel = data.error === "已取消";
+            updateMessages(prev => {
+              let next = prev;
+              // Finalize an in-progress streaming bubble so its blinking cursor stops.
+              const last = next[next.length - 1];
+              if (last?.streaming) next = [...next.slice(0, -1), { ...last, streaming: false }];
+              // A tool still showing "进行中" was interrupted (cancel emits no tool_result) — mark it stopped.
+              next = next.map(m =>
+                m.role === "tool" && m.content.startsWith("[进行中]")
+                  ? { ...m, content: m.content.replace("[进行中]", "[已停止]"), toolSuccess: false }
+                  : m
+              );
+              return [...next, { role: "assistant", content: isCancel ? "已取消生成。" : `出错了：${data.error}` }];
+            });
             streamingTextRef.current = "";
             setLoading(false);
             break;

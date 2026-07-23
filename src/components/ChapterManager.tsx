@@ -812,6 +812,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                       <span className={`phase-badge phase-${batchProgress.phase}`}>
                         {batchProgress.phase === "context" && "构建上下文..."}
                         {batchProgress.phase === "generating" && "生成中..."}
+                        {batchProgress.phase === "retrying" && `重试中 ${batchProgress.error}`}
                         {batchProgress.phase === "summarizing" && "摘要中..."}
                         {batchProgress.phase === "done" && `完成 ${batchProgress.word_count} 字`}
                         {batchProgress.phase === "skipped" && "已跳过"}
@@ -828,7 +829,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                   <div className="batch-result">
                     <span>完成 {batchResult.completed} 章</span>
                     {batchResult.skipped > 0 && <span className="dim">跳过 {batchResult.skipped}</span>}
-                    {batchResult.failed > 0 && <span className="batch-failed">失败 {batchResult.failed}（第 {batchResult.failed_chapters.join("、")} 章）</span>}
+                    {batchResult.failed > 0 && <span className="batch-failed">失败 {batchResult.failed}（第 {batchResult.failed_chapters.join("、")} 章），已停止后续</span>}
                     <span className="dim">共 {batchResult.total_words} 字 · 耗时 {Math.floor(batchResult.elapsed_seconds / 60)}分{batchResult.elapsed_seconds % 60}秒</span>
                   </div>
                 )}
@@ -868,6 +869,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                             {batchStatus === "generating" && <><span className="loading-spinner" />生成中</>}
                             {batchStatus === "summarizing" && <><span className="loading-spinner" />摘要中</>}
                             {batchStatus === "context" && <><span className="loading-spinner" />准备中</>}
+                            {batchStatus === "retrying" && <><span className="loading-spinner" />重试中</>}
                             {batchStatus === "done" && "已生成"}
                             {batchStatus === "skipped" && "已跳过"}
                             {batchStatus === "failed" && "失败"}

@@ -863,10 +863,55 @@ fn is_prompt_too_long(error: &str) -> bool {
         || lower.contains("token limit")
 }
 
+/// True for generation errors that retrying can't fix — auth failures, an
+/// exhausted balance/quota, or an over-long prompt. Batch generation retries
+/// everything else (network blips, rate limits, malformed JSON) until the
+/// chapter succeeds, but these would just fail identically forever, so the batch
+/// stops and surfaces the reason instead of spinning.
+fn batch_error_is_fatal(err: &str) -> bool {
+    if is_prompt_too_long(err) {
+        return true;
+    }
+    let l = err.to_lowercase();
+    [
+        "401", "403", "unauthorized", "authentication",
+        "invalid api key", "invalid_api_key", "incorrect api key",
+        "insufficient", "quota exceeded", "余额", "欠费",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
 #[tauri::command]
 async fn cancel_agent_chat() -> Result<(), String> {
     AGENT_CANCEL.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Resolves as soon as `flag` flips to true (polled at ~80ms). Raced against
+/// long-running awaits (streaming LLM calls, tool/chapter generation) so a
+/// cancel request interrupts in-flight work promptly instead of only being
+/// noticed between coarse steps — which left work running (looked like "取消没反应").
+async fn wait_cancel(flag: &'static AtomicBool) {
+    while !flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+}
+
+/// Await `$fut`, but bail out of the whole command the instant cancellation is
+/// requested. Dropping the raced future aborts its HTTP request, so no further
+/// tokens are produced. On cancel, emit the cancel event and return.
+macro_rules! agent_race {
+    ($app:expr, $fut:expr) => {
+        tokio::select! {
+            biased;
+            _ = wait_cancel(&AGENT_CANCEL) => {
+                let _ = $app.emit("agent_event", llm::client::StreamEvent::Error { error: "已取消".into() });
+                return Ok(());
+            }
+            r = $fut => r,
+        }
+    };
 }
 
 #[tauri::command]
@@ -961,7 +1006,7 @@ async fn agent_chat_stream(
         eprintln!("[Agent] Iteration {}/{}", iteration + 1, max_iterations);
 
         let app_clone = app.clone();
-        let response = client.chat_with_tools_stream(
+        let response = agent_race!(app, client.chat_with_tools_stream(
             &system,
             &send_msgs,
             &tool_defs,
@@ -969,7 +1014,7 @@ async fn agent_chat_stream(
             move |delta| {
                 let _ = app_clone.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
             },
-        ).await;
+        ));
 
         let response = match response {
             Ok(r) => r,
@@ -978,12 +1023,12 @@ async fn agent_chat_stream(
                     eprintln!("[Agent] Prompt too long, attempting aggressive compaction...");
                     let compact_msgs = engine::context::aggressive_compact(&conversation, max_context_tokens);
                     let app_retry = app.clone();
-                    let retry = client.chat_with_tools_stream(
+                    let retry = agent_race!(app, client.chat_with_tools_stream(
                         &system, &compact_msgs, &tool_defs, 4096,
                         move |delta| {
                             let _ = app_retry.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
                         },
-                    ).await;
+                    ));
                     match retry {
                         Ok(r) => r,
                         Err(e2) => {
@@ -1014,12 +1059,12 @@ async fn agent_chat_stream(
                 });
                 let cont_msgs = engine::context::compact_conversation(&conversation, max_context_tokens);
                 let app_cont = app.clone();
-                let cont_resp = client.chat_with_tools_stream(
+                let cont_resp = agent_race!(app, client.chat_with_tools_stream(
                     &system, &cont_msgs, &tool_defs, 4096,
                     move |delta| {
                         let _ = app_cont.emit("agent_event", StreamEvent::Token { delta: delta.to_string() });
                     },
-                ).await;
+                ));
                 conversation.pop(); // remove temp user msg
                 conversation.pop(); // remove temp assistant msg
                 match cont_resp {
@@ -1079,7 +1124,7 @@ async fn agent_chat_stream(
                 }
             }).collect();
 
-            let results = futures_util::future::join_all(read_futures).await;
+            let results = agent_race!(app, futures_util::future::join_all(read_futures));
             for (id, name, result) in results {
                 let (success, result_str) = match &result {
                     Ok(v) => (true, serde_json::to_string_pretty(v).unwrap_or_default()),
@@ -1104,9 +1149,9 @@ async fn agent_chat_stream(
                 let _ = app.emit("agent_event", StreamEvent::Error { error: "已取消".into() });
                 return Ok(());
             }
-            let result = tools::execute_tool(
+            let result = agent_race!(app, tools::execute_tool(
                 &tool_call.name, &tool_call.input, &project_id, &client, &constraints_text,
-            ).await;
+            ));
             let (success, result_str) = match &result {
                 Ok(v) => (true, serde_json::to_string_pretty(v).unwrap_or_default()),
                 Err(e) => (false, format!("错误: {}", e)),
@@ -2383,6 +2428,13 @@ async fn batch_generate_chapters(
 
         let client = make_client(&api_format, &api_key, &model, &base_url, proxy_url, user_agent);
 
+        // How a chapter's generation ended. Failed and Cancelled both stop the batch.
+        enum ChapterOutcome { Done { word_count: u32 }, Failed(String), Cancelled }
+        // A chapter must SUCCEED before the next one starts, so transient failures
+        // are retried until they do. MAX_RETRIES is only a defensive ceiling so a
+        // mis-classified permanent error can't loop forever — normal runs never hit it.
+        const MAX_RETRIES: u32 = 50;
+
         for (idx, chapter_number) in (start_chapter..=end_chapter).enumerate() {
             // Check cancel
             if BATCH_CANCEL.load(Ordering::SeqCst) {
@@ -2415,106 +2467,145 @@ async fn batch_generate_chapters(
                 phase: "context".to_string(), word_count: 0, error: String::new(),
             });
 
-            // Build context + outline
-            let context = match build_rich_context_string(&project_id, chapter_number) {
-                Ok(c) => c,
-                Err(e) => {
-                    failed += 1;
-                    failed_chapters.push(chapter_number);
-                    let _ = app.emit("batch_progress", BatchProgress {
-                        current: idx as u32 + 1, total, chapter_number,
-                        phase: "failed".to_string(), word_count: 0, error: e,
-                    });
-                    continue;
-                }
-            };
+            // Generate one chapter. A fatal failure (missing outline, generation
+            // that fails even after retries, or a save error) STOPS the whole
+            // batch — later chapters use this one's text + summary as RAG context,
+            // so pressing on would only produce broken continuations.
+            let chapter_file = format!("chapter_{:03}.json", chapter_number);
+            let outcome: ChapterOutcome = 'chapter: {
+                // Structural errors (missing context/outline) aren't retryable.
+                let context = match build_rich_context_string(&project_id, chapter_number) {
+                    Ok(c) => c,
+                    Err(e) => break 'chapter ChapterOutcome::Failed(format!("构建上下文失败：{}", e)),
+                };
+                let chapter_outline = match find_chapter_outline(&project_id, chapter_number) {
+                    Ok(o) => o,
+                    Err(e) => break 'chapter ChapterOutcome::Failed(format!("获取大纲失败：{}", e)),
+                };
 
-            let chapter_outline = match find_chapter_outline(&project_id, chapter_number) {
-                Ok(o) => o,
-                Err(e) => {
-                    failed += 1;
-                    failed_chapters.push(chapter_number);
-                    let _ = app.emit("batch_progress", BatchProgress {
-                        current: idx as u32 + 1, total, chapter_number,
-                        phase: "failed".to_string(), word_count: 0, error: e,
-                    });
-                    continue;
-                }
-            };
+                let constraints_text = build_constraints_text(constraints_clone.as_ref());
+                let prompt = format!("{}\n\n{}", truncate_chars(&constraints_text, 2000), chapter_outline);
 
-            // Phase: generating
-            let _ = app.emit("batch_progress", BatchProgress {
-                current: idx as u32 + 1, total, chapter_number,
-                phase: "generating".to_string(), word_count: 0, error: String::new(),
-            });
-
-            let constraints_text = build_constraints_text(constraints_clone.as_ref());
-            let result = engine::expand_chapter(
-                &client,
-                &format!("{}\n\n{}", truncate_chars(&constraints_text, 2000), chapter_outline),
-                "",
-                target_words,
-                &context,
-            ).await;
-
-            match result {
-                Ok(chapter_data) => {
-                    let chapter_file = format!("chapter_{:03}.json", chapter_number);
-                    // Snapshot + save under the project lock so a concurrent reorder
-                    // or autosave can't interleave; released before summarizing.
-                    let save_result = {
-                        let lock = storage::project_lock(&project_id);
-                        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
-                            if let Some(old) = existing["text"].as_str() {
-                                if !old.is_empty() {
-                                    let _ = storage::save_snapshot(&project_id, chapter_number, old);
+                // Generate, retrying transient failures with interruptible backoff.
+                let chapter_data = {
+                    let mut attempt = 0u32;
+                    loop {
+                        attempt += 1;
+                        if BATCH_CANCEL.load(Ordering::SeqCst) {
+                            break 'chapter ChapterOutcome::Cancelled;
+                        }
+                        let _ = app.emit("batch_progress", BatchProgress {
+                            current: idx as u32 + 1, total, chapter_number,
+                            phase: "generating".to_string(), word_count: 0, error: String::new(),
+                        });
+                        // Race generation against cancellation so a mid-chapter cancel
+                        // takes effect at once instead of after the (minute-long) call.
+                        let gen = tokio::select! {
+                            biased;
+                            _ = wait_cancel(&BATCH_CANCEL) => None,
+                            r = engine::expand_chapter(&client, &prompt, "", target_words, &context) => Some(r),
+                        };
+                        match gen {
+                            None => break 'chapter ChapterOutcome::Cancelled,
+                            Some(Ok(data)) => break data,
+                            Some(Err(e)) => {
+                                // Keep retrying until this chapter succeeds — the next
+                                // chapter can't start until it does. Only give up on
+                                // errors retrying can't fix, or the defensive ceiling.
+                                if batch_error_is_fatal(&e) {
+                                    break 'chapter ChapterOutcome::Failed(format!("无法生成（重试也解决不了）：{}", e));
+                                }
+                                if attempt >= MAX_RETRIES {
+                                    break 'chapter ChapterOutcome::Failed(format!("重试 {} 次仍失败，已停止：{}", MAX_RETRIES, e));
+                                }
+                                let _ = app.emit("batch_progress", BatchProgress {
+                                    current: idx as u32 + 1, total, chapter_number,
+                                    phase: "retrying".to_string(), word_count: 0,
+                                    error: format!("[第 {} 次] {}", attempt, e),
+                                });
+                                // Backoff grows with attempts but is capped at 20s.
+                                let backoff = (3 * attempt).min(20) as u64;
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_cancel(&BATCH_CANCEL) => break 'chapter ChapterOutcome::Cancelled,
+                                    _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
                                 }
                             }
                         }
-                        storage::save_json(&project_id, &chapter_file, &chapter_data)
-                    };
-                    if let Err(e) = save_result {
-                        failed += 1;
-                        failed_chapters.push(chapter_number);
-                        let _ = app.emit("batch_progress", BatchProgress {
-                            current: idx as u32 + 1, total, chapter_number,
-                            phase: "failed".to_string(), word_count: 0, error: e,
-                        });
-                        continue;
                     }
+                };
 
-                    let word_count = chapter_data["text"].as_str().map(|t| t.chars().count() as u32).unwrap_or(0);
-                    total_word_count += word_count;
+                // Snapshot + save under the project lock so a concurrent reorder or
+                // autosave can't interleave; released before summarizing. Save error
+                // is fatal (later chapters would build on a chapter that isn't there).
+                let save_result = {
+                    let lock = storage::project_lock(&project_id);
+                    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Ok(Some(existing)) = storage::load_json(&project_id, &chapter_file) {
+                        if let Some(old) = existing["text"].as_str() {
+                            if !old.is_empty() {
+                                let _ = storage::save_snapshot(&project_id, chapter_number, old);
+                            }
+                        }
+                    }
+                    storage::save_json(&project_id, &chapter_file, &chapter_data)
+                };
+                if let Err(e) = save_result {
+                    break 'chapter ChapterOutcome::Failed(format!("保存失败：{}", e));
+                }
 
-                    // Phase: summarizing
-                    let _ = app.emit("batch_progress", BatchProgress {
-                        current: idx as u32 + 1, total, chapter_number,
-                        phase: "summarizing".to_string(), word_count, error: String::new(),
-                    });
+                let word_count = chapter_data["text"].as_str().map(|t| t.chars().count() as u32).unwrap_or(0);
 
-                    // Auto-summarize for next chapter's RAG
-                    if let Err(e) = auto_summarize_and_save(&client, &project_id, chapter_number).await {
-                        // Summarization failure is non-fatal: chapter is saved, just log the error
+                // Phase: summarizing — non-fatal (chapter text is already saved), but
+                // still interruptible so cancel is responsive during summarization.
+                let _ = app.emit("batch_progress", BatchProgress {
+                    current: idx as u32 + 1, total, chapter_number,
+                    phase: "summarizing".to_string(), word_count, error: String::new(),
+                });
+                let summ = tokio::select! {
+                    biased;
+                    _ = wait_cancel(&BATCH_CANCEL) => None,
+                    r = auto_summarize_and_save(&client, &project_id, chapter_number) => Some(r),
+                };
+                match summ {
+                    None => break 'chapter ChapterOutcome::Cancelled,
+                    Some(Err(e)) => {
                         let _ = app.emit("batch_progress", BatchProgress {
                             current: idx as u32 + 1, total, chapter_number,
                             phase: "summarize_failed".to_string(), word_count, error: e,
                         });
                     }
+                    Some(Ok(_)) => {}
+                }
 
+                ChapterOutcome::Done { word_count }
+            };
+
+            match outcome {
+                ChapterOutcome::Done { word_count } => {
+                    total_word_count += word_count;
                     completed += 1;
                     let _ = app.emit("batch_progress", BatchProgress {
                         current: idx as u32 + 1, total, chapter_number,
                         phase: "done".to_string(), word_count, error: String::new(),
                     });
                 }
-                Err(e) => {
+                ChapterOutcome::Cancelled => {
+                    let _ = app.emit("batch_progress", BatchProgress {
+                        current: idx as u32 + 1, total, chapter_number,
+                        phase: "cancelled".to_string(), word_count: 0, error: String::new(),
+                    });
+                    break;
+                }
+                ChapterOutcome::Failed(error) => {
                     failed += 1;
                     failed_chapters.push(chapter_number);
                     let _ = app.emit("batch_progress", BatchProgress {
                         current: idx as u32 + 1, total, chapter_number,
-                        phase: "failed".to_string(), word_count: 0, error: e,
+                        phase: "failed".to_string(), word_count: 0, error,
                     });
+                    // Stop the batch: don't build later chapters on a broken base.
+                    break;
                 }
             }
         }

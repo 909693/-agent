@@ -159,8 +159,11 @@ export async function startBatch(params: StartBatchParams): Promise<void> {
       aggregate.elapsed_seconds += chunkResult.elapsed_seconds;
       aggregate.failed_chapters = aggregate.failed_chapters.concat(chunkResult.failed_chapters);
 
-      // If this chunk was cancelled mid-way, stop scheduling more chunks.
+      // Stop scheduling more chunks if this one was cancelled or hit a failure.
+      // A failed chapter halts the batch (later chapters depend on it), so the
+      // remaining chunks must not run either.
       if (state.progress?.phase === "cancelled" || cancelled) break;
+      if (chunkResult.failed > 0) break;
     }
   } catch (e) {
     // e.g. ensureListeners failed — surface it instead of leaving a silent hang.

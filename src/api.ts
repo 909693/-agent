@@ -64,7 +64,7 @@ export interface BatchProgress {
   current: number;
   total: number;
   chapter_number: number;
-  phase: "context" | "generating" | "summarizing" | "done" | "skipped" | "failed" | "cancelled" | "summarize_failed";
+  phase: "context" | "generating" | "retrying" | "summarizing" | "done" | "skipped" | "failed" | "cancelled" | "summarize_failed";
   word_count: number;
   error: string;
 }
