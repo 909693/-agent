@@ -522,54 +522,73 @@ impl LlmClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<Value, String> {
-        // Each call_* returns the RAW text plus a truncated flag instead of
-        // parsing internally, so truncation can be recovered here uniformly.
-        let (mut text, truncated) = match self.config.provider.as_str() {
-            "anthropic" => {
-                self.call_claude(system_prompt, user_prompt, max_tokens)
-                    .await?
-            }
-            "openai" => {
-                self.call_openai(system_prompt, user_prompt, max_tokens)
-                    .await?
-            }
-            "openai-responses" => {
-                self.call_openai_responses(system_prompt, user_prompt, max_tokens)
-                    .await?
-            }
-            "gemini" => {
-                self.call_gemini(system_prompt, user_prompt, max_tokens)
-                    .await?
-            }
-            other => return Err(format!("Unknown provider: {other}")),
-        };
+        // Outer retry: some relays cleanly close the SSE stream after a few
+        // bytes (e.g. the model got as far as "I'm struct" — no error, no
+        // stop_reason, nothing to stitch). A tiny non-JSON response is a
+        // transport failure, not model output — retry the whole request.
+        let mut attempt = 0u32;
+        loop {
+            // Each call_* returns the RAW text plus a truncated flag instead of
+            // parsing internally, so truncation can be recovered here uniformly.
+            let (mut text, truncated) = match self.config.provider.as_str() {
+                "anthropic" => {
+                    self.call_claude(system_prompt, user_prompt, max_tokens)
+                        .await?
+                }
+                "openai" => {
+                    self.call_openai(system_prompt, user_prompt, max_tokens)
+                        .await?
+                }
+                "openai-responses" => {
+                    self.call_openai_responses(system_prompt, user_prompt, max_tokens)
+                        .await?
+                }
+                "gemini" => {
+                    self.call_gemini(system_prompt, user_prompt, max_tokens)
+                        .await?
+                }
+                other => return Err(format!("Unknown provider: {other}")),
+            };
 
-        // Truncated output (max_tokens): ask the model to resume from the cut
-        // point and stitch, instead of hoping repair can salvage half the JSON.
-        // Loop ends as soon as the stitched text parses cleanly.
-        if truncated {
-            for round in 1..=3u32 {
-                if parse_json_strict(&text).is_some() {
-                    break; // already complete (some providers over-report truncation)
+            // Truncated output (max_tokens): ask the model to resume from the cut
+            // point and stitch, instead of hoping repair can salvage half the JSON.
+            // Loop ends as soon as the stitched text parses cleanly.
+            if truncated {
+                for round in 1..=3u32 {
+                    if parse_json_strict(&text).is_some() {
+                        break; // already complete (some providers over-report truncation)
+                    }
+                    eprintln!("[LlmClient] JSON 输出被截断（当前 {} 字节），请求续写 {}/3", text.len(), round);
+                    let cont = self.chat(system_prompt, &[
+                        ("user".to_string(), user_prompt.to_string()),
+                        ("assistant".to_string(), text.clone()),
+                        ("user".to_string(), "你的 JSON 输出在上面被截断了。请从截断处直接继续输出剩余内容：不要重复任何已输出的字符，不要添加任何解释或 markdown 代码块标记，直接接着写。".to_string()),
+                    ], max_tokens).await?;
+                    // Strip any fence the model wrapped the continuation in.
+                    let cont = cont.trim();
+                    let cont = cont.strip_prefix("```json").or_else(|| cont.strip_prefix("```")).unwrap_or(cont);
+                    let cont = cont.strip_suffix("```").unwrap_or(cont);
+                    if cont.trim().is_empty() {
+                        break;
+                    }
+                    text.push_str(cont);
                 }
-                eprintln!("[LlmClient] JSON 输出被截断（当前 {} 字节），请求续写 {}/3", text.len(), round);
-                let cont = self.chat(system_prompt, &[
-                    ("user".to_string(), user_prompt.to_string()),
-                    ("assistant".to_string(), text.clone()),
-                    ("user".to_string(), "你的 JSON 输出在上面被截断了。请从截断处直接继续输出剩余内容：不要重复任何已输出的字符，不要添加任何解释或 markdown 代码块标记，直接接着写。".to_string()),
-                ], max_tokens).await?;
-                // Strip any fence the model wrapped the continuation in.
-                let cont = cont.trim();
-                let cont = cont.strip_prefix("```json").or_else(|| cont.strip_prefix("```")).unwrap_or(cont);
-                let cont = cont.strip_suffix("```").unwrap_or(cont);
-                if cont.trim().is_empty() {
-                    break;
+            }
+
+            match parse_json_from_text(&text) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let tiny_garbage = text.trim().chars().count() < 100 && !text.contains('{');
+                    if tiny_garbage && attempt < 2 {
+                        attempt += 1;
+                        eprintln!("[LlmClient] 响应过短且非 JSON（{} 字节，疑似流被中断），整体重试 {}/2", text.len(), attempt);
+                        sleep(Duration::from_secs(2 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
                 }
-                text.push_str(cont);
             }
         }
-
-        parse_json_from_text(&text)
     }
 
     /// Multi-turn chat, returns plain text response
