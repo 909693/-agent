@@ -1571,6 +1571,10 @@ async fn save_characters_data(project_id: String, characters: Value) -> Result<V
     Ok(characters)
 }
 
+/// Generate one act's (or sub-chunk's) chapter details, retrying on BOTH request
+/// failure and incomplete output — a "successful" response with missing chapters
+/// used to be accepted silently, leaving whole acts empty in the outline (UI
+/// showed e.g. ch.29 jumping straight to ch.59). Returns the chapters array.
 async fn generate_act_chapters_with_retry(
     client: &LlmClient,
     act_number: u32,
@@ -1584,22 +1588,35 @@ async fn generate_act_chapters_with_retry(
     prev_act_summary: &str,
     next_act_summary: &str,
     plot_points_json: &str,
-) -> Result<Value, String> {
-    // Try once; on failure, retry once with a slight delay
-    match engine::generate_act_chapters(
-        client, act_number, act_title, act_theme, act_key_events, act_end_state,
-        chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
-    ).await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            eprintln!("[generate_act_chapters_with_retry] Retry after error: {}", e);
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            engine::generate_act_chapters(
-                client, act_number, act_title, act_theme, act_key_events, act_end_state,
-                chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
-            ).await
+) -> Result<Vec<Value>, String> {
+    let expected = (chapter_end - chapter_start + 1) as usize;
+    let mut last_err = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+        }
+        match engine::generate_act_chapters(
+            client, act_number, act_title, act_theme, act_key_events, act_end_state,
+            chapter_start, chapter_end, story_context, prev_act_summary, next_act_summary, plot_points_json,
+        ).await {
+            Ok(v) => {
+                let mut chapters = v["chapters"].as_array().cloned().unwrap_or_default();
+                if chapters.len() >= expected {
+                    chapters.truncate(expected); // drop over-generation beyond the range
+                    return Ok(chapters);
+                }
+                last_err = format!("模型只返回了 {}/{} 章", chapters.len(), expected);
+                eprintln!("[act_chapters] 第 {} 幕(第{}-{}章)产出不完整({})，重试 {}/2",
+                    act_number, chapter_start, chapter_end, last_err, attempt + 1);
+            }
+            Err(e) => {
+                eprintln!("[act_chapters] 第 {} 幕(第{}-{}章)请求失败: {}，重试 {}/2",
+                    act_number, chapter_start, chapter_end, e, attempt + 1);
+                last_err = e;
+            }
         }
     }
+    Err(format!("第 {} 幕（第 {}-{} 章）生成失败（已重试 2 次）：{}", act_number, chapter_start, chapter_end, last_err))
 }
 
 async fn generate_plot_chunked(
@@ -1687,16 +1704,15 @@ async fn generate_plot_chunked(
         // At ~600 tokens/chapter, each chunk fits ~22 chapters
         let act_chapters_count = chapter_end - chapter_start + 1;
         let chunk_size = 22;
+        // A failed act ABORTS the whole outline generation (with a clear error)
+        // instead of silently leaving the act empty — an outline with a hole in
+        // the middle breaks batch generation and reads as data loss to the user.
         let all_chapters: Vec<Value> = if act_chapters_count <= chunk_size {
             // Small act: single call
-            let result = generate_act_chapters_with_retry(
+            generate_act_chapters_with_retry(
                 client, act_num, act_title, act_theme, &act_key_events, act_end_state,
                 chapter_start, chapter_end, &story_context, &prev_summary, &next_summary, &plot_points_json,
-            ).await;
-            match result {
-                Ok(data) => data["chapters"].as_array().cloned().unwrap_or_default(),
-                Err(e) => { eprintln!("[generate_plot_chunked] Act {} failed: {}", act_num, e); Vec::new() }
-            }
+            ).await?
         } else {
             // Large act: split into sub-chunks
             let mut chunks: Vec<Value> = Vec::new();
@@ -1705,37 +1721,21 @@ async fn generate_plot_chunked(
             while sub_start <= chapter_end {
                 sub_idx += 1;
                 let sub_end = (sub_start + chunk_size - 1).min(chapter_end);
-                let sub_num = sub_end - sub_start + 1;
                 if sub_idx > 1 {
                     // Small delay between sub-chunks to avoid rate limiting
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                let result = generate_act_chapters_with_retry(
+                let got = generate_act_chapters_with_retry(
                     client, act_num, act_title, act_theme, &act_key_events, act_end_state,
                     sub_start, sub_end, &story_context, &prev_summary, &next_summary, &plot_points_json,
-                ).await;
-                match result {
-                    Ok(data) => {
-                        if let Some(c) = data["chapters"].as_array() {
-                            let got = c.len();
-                            eprintln!("[generate_plot_chunked] Act {} sub-chunk {}/{} (ch {}-{}) got {}/{} chapters",
-                                act_num, sub_idx, (act_chapters_count + chunk_size - 1) / chunk_size, sub_start, sub_end, got, sub_num);
-                            chunks.extend(c.iter().cloned());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[generate_plot_chunked] Act {} sub-chunk {}/{} failed: {}", act_num, sub_idx, (act_chapters_count + chunk_size - 1) / chunk_size, e);
-                    }
-                }
+                ).await?;
+                eprintln!("[generate_plot_chunked] Act {} sub-chunk {} (ch {}-{}) got {} chapters",
+                    act_num, sub_idx, sub_start, sub_end, got.len());
+                chunks.extend(got);
                 sub_start = sub_end + 1;
             }
             chunks
         };
-
-        let expected = (chapter_end - chapter_start + 1) as usize;
-        if all_chapters.len() < expected {
-            eprintln!("[generate_plot_chunked] Act {} got {}/{} chapters", act_num, all_chapters.len(), expected);
-        }
 
         merged_acts.push(json!({
             "number": act_num,
@@ -1812,6 +1812,21 @@ async fn generate_plot(
             &world_summary, &chars_summary, target_chapters,
         ).await?
     };
+
+    // Don't persist an outline with missing chapters — a hole in the middle
+    // breaks batch generation later and reads as data loss in the chapter list.
+    let got_chapters = plot["acts"].as_array()
+        .map(|a| a.iter().flat_map(|act| act["chapters"].as_array()).flatten().count())
+        .unwrap_or(0);
+    // Allow modest deviation for the single-shot path (model may restructure),
+    // but an outline at <80% of target means whole sections went missing.
+    let min_ok = (chapters as usize) * 8 / 10;
+    if got_chapters < min_ok.max(1) {
+        return Err(format!(
+            "大纲不完整：目标 {} 章，实际只生成了 {} 章，已放弃保存。请重试（可能是 API 响应被截断）",
+            chapters, got_chapters
+        ));
+    }
 
     storage::save_json(&project_id, "plot.json", &plot)?;
     Ok(plot)
