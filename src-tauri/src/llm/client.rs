@@ -351,6 +351,10 @@ pub struct LlmConfig {
     pub proxy_url: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// 思考等级：None/"off" 关闭；"low"/"medium"/"high" 按供应商映射为
+    /// Anthropic thinking budget / OpenAI reasoning_effort / Gemini thinkingBudget。
+    #[serde(default)]
+    pub thinking_level: Option<String>,
 }
 
 /// Parse a user-supplied User-Agent into a HeaderValue, rejecting empty or
@@ -377,6 +381,9 @@ struct OpenAIRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
+    /// 思考等级映射：reasoning 模型的 low/medium/high；None 时不发送该字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     /// Explicitly disable streaming to avoid SSE chunked responses
     stream: bool,
 }
@@ -405,6 +412,9 @@ struct GeminiGenConfig {
     temperature: f32,
     max_output_tokens: u32,
     response_mime_type: String,
+    /// Gemini 2.5+ thinkingConfig（REST 同时接受 snake_case）；None 时不发送
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +429,60 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    /// Normalized thinking level; None when off/unset/unknown.
+    fn thinking_level(&self) -> Option<&str> {
+        match self.config.thinking_level.as_deref() {
+            Some(l @ ("low" | "medium" | "high" | "xhigh" | "max")) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Token budget per thinking level (shared by Anthropic budget_tokens and
+    /// Gemini thinkingBudget).
+    fn thinking_budget(level: &str) -> u32 {
+        match level {
+            "low" => 2048,
+            "medium" => 8192,
+            "high" => 16384,
+            "xhigh" => 32768,
+            _ => 49152, // max
+        }
+    }
+
+    /// OpenAI reasoning_effort 只接受 low/medium/high：xhigh/max 归并为 high。
+    fn openai_effort(&self) -> Option<String> {
+        self.thinking_level().map(|l| match l {
+            "xhigh" | "max" => "high".to_string(),
+            other => other.to_string(),
+        })
+    }
+
+    /// Anthropic thinking params: (thinking block, effective max_tokens, temperature).
+    /// With thinking enabled the API requires budget_tokens < max_tokens（思考
+    /// 从 max_tokens 池里扣）and temperature = 1，so both are adjusted here.
+    /// 总量夹到 64k：更高档位在输出上限较小的模型上会被 API 拒绝。
+    fn claude_thinking_params(&self, max_tokens: u32, default_temp: f64) -> (Value, u32, f64) {
+        match self.thinking_level() {
+            Some(level) => {
+                let budget = Self::thinking_budget(level);
+                let eff_max = (max_tokens + budget).min(64_000);
+                (
+                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+                    eff_max,
+                    1.0,
+                )
+            }
+            None => (serde_json::json!({"type": "disabled"}), max_tokens, default_temp),
+        }
+    }
+
+    /// Gemini generationConfig.thinkingConfig; None when thinking is off.
+    /// budget 夹到 24576（flash 系上限，pro 虽支持 32768，取全系安全值）。
+    fn gemini_thinking_config(&self) -> Option<Value> {
+        self.thinking_level()
+            .map(|l| serde_json::json!({"thinking_budget": Self::thinking_budget(l).min(24_576)}))
+    }
+
     pub fn new(config: LlmConfig) -> Self {
         // Only accept invalid certs if explicitly enabled by user
         let accept_invalid = config.accept_invalid_certs;
@@ -639,11 +703,12 @@ impl LlmClient {
         let model_name = self.config.model
             .replace("-thinking", "")
             .replace("-cc", "");
+        let (thinking, eff_max_tokens, temperature) = self.claude_thinking_params(max_tokens, 0.7);
         let body = serde_json::json!({
             "model": model_name,
-            "max_tokens": max_tokens,
-            "temperature": 0.7,
-            "thinking": { "type": "disabled" },
+            "max_tokens": eff_max_tokens,
+            "temperature": temperature,
+            "thinking": thinking,
             "stream": true,
             "system": system_prompt,
             "messages": msgs,
@@ -690,6 +755,7 @@ impl LlmClient {
             temperature: 0.7,
             messages: msgs,
             response_format: None,
+            reasoning_effort: self.openai_effort(),
             stream: true,
         };
         let url = self.openai_url();
@@ -746,6 +812,7 @@ impl LlmClient {
                 temperature: 0.7,
                 max_output_tokens: max_tokens,
                 response_mime_type: "text/plain".into(),
+                thinking_config: self.gemini_thinking_config(),
             }),
         };
         let url = self.gemini_url();
@@ -828,14 +895,15 @@ impl LlmClient {
         let model_name = self.config.model
             .replace("-thinking", "")
             .replace("-cc", "");
+        let (thinking, eff_max_tokens, temperature) = self.claude_thinking_params(max_tokens, 0.3);
         let body = serde_json::json!({
             "model": model_name,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            "thinking": { "type": "disabled" },
+            "max_tokens": eff_max_tokens,
+            "temperature": temperature,
+            "thinking": thinking,
             "stream": true,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": format!("{user_prompt}\n\nIMPORTANT: Return ONLY valid JSON, no internal thinking, no tool calls, no commentary. Direct JSON output only.")}],
+            "messages": [{"role": "user", "content": format!("{user_prompt}\n\nIMPORTANT: Return ONLY valid JSON, no tool calls, no commentary. Direct JSON output only.")}],
         });
         let url = self.claude_url();
 
@@ -875,6 +943,7 @@ impl LlmClient {
                 },
             ],
             response_format: None,
+            reasoning_effort: self.openai_effort(),
             stream: true,
         };
         let url = self.openai_url();
@@ -929,6 +998,7 @@ impl LlmClient {
                 temperature: 0.3,
                 max_output_tokens: max_tokens,
                 response_mime_type: "application/json".into(),
+                thinking_config: self.gemini_thinking_config(),
             }),
         };
         let url = self.gemini_url();
@@ -998,7 +1068,7 @@ impl LlmClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<(String, bool), String> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "instructions": system_prompt,
             "input": [{"role": "user", "content": format!("{user_prompt}\n\nReturn valid JSON.")}],
@@ -1006,6 +1076,9 @@ impl LlmClient {
             "temperature": 0.3,
             "stream": false,
         });
+        if let Some(level) = self.openai_effort() {
+            body["reasoning"] = serde_json::json!({"effort": level});
+        }
         let url = self.responses_url();
         eprintln!("[LlmClient] Calling OpenAI Responses API: {}", url);
         eprintln!("[LlmClient] Model: {}, max_output_tokens: {}", self.config.model, max_tokens);
@@ -1033,7 +1106,7 @@ impl LlmClient {
             .iter()
             .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
             .collect();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "instructions": system_prompt,
             "input": input,
@@ -1041,6 +1114,9 @@ impl LlmClient {
             "temperature": 0.7,
             "stream": false,
         });
+        if let Some(level) = self.openai_effort() {
+            body["reasoning"] = serde_json::json!({"effort": level});
+        }
         let url = self.responses_url();
         let (ok, data) = self.post_json_retry(&url, &[
             ("Authorization", format!("Bearer {}", self.config.api_key)),
@@ -1260,6 +1336,9 @@ impl LlmClient {
                 "model": model_name,
                 "max_tokens": max_tokens,
                 "temperature": 0.7,
+                // Agent 多轮 tool use 下开启 thinking 需要在后续轮次回传
+                // assistant 的 thinking block（build_anthropic_messages 未保留），
+                // 否则 API 直接报错——Agent 路径固定关闭，思考等级只作用于写作路径。
                 "thinking": {"type": "disabled"},
                 "stream": true,
                 "system": system,

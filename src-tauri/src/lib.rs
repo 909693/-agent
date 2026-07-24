@@ -9,6 +9,7 @@ use llm::client::{LlmClient, LlmConfig};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Emitter;
 use uuid::Uuid;
@@ -18,6 +19,11 @@ use storage::{
 
 static BATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 static BATCH_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 顶栏「思考等级」全局设置："off"/"low"/"medium"/"high"（空串视为 off）。
+/// 前端启动和切换时通过 set_thinking_level 写入，make_client 统一读取——
+/// 作为会话级偏好走全局态，避免给几十个命令逐一加参数。
+static THINKING_LEVEL: Mutex<String> = Mutex::new(String::new());
 
 const CHUNKED_PLOT_THRESHOLD: u32 = 60;
 
@@ -1448,6 +1454,13 @@ fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, pro
         "gemini" => "gemini-2.5-flash",
         _ => "gpt-4o",
     };
+    let thinking_level = {
+        let level = THINKING_LEVEL.lock().unwrap();
+        match level.as_str() {
+            "low" | "medium" | "high" | "xhigh" | "max" => Some(level.clone()),
+            _ => None,
+        }
+    };
     LlmClient::new(LlmConfig {
         provider: api_format.to_string(),
         api_key: api_key.to_string(),
@@ -1459,8 +1472,14 @@ fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, pro
         base_url: base_url.to_string(),
         proxy_url,
         user_agent,
+        thinking_level,
         accept_invalid_certs: false, // Default to secure mode
     })
+}
+
+#[tauri::command]
+fn set_thinking_level(level: String) {
+    *THINKING_LEVEL.lock().unwrap() = level;
 }
 
 #[tauri::command]
@@ -3204,6 +3223,7 @@ pub fn run() {
             get_llm_profiles,
             save_llm_providers,
             get_llm_providers,
+            set_thinking_level,
             agent_chat,
             agent_chat_stream,
             cancel_agent_chat,

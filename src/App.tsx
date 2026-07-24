@@ -48,6 +48,8 @@ function App() {
   const [activeId, setActiveId] = useState<string>("");
   const [llmLoaded, setLlmLoaded] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("retl_theme") || "light");
+  // 思考等级(off/low/medium/high):本地持久化,并同步到后端全局生效
+  const [thinkingLevel, setThinkingLevel] = useState(localStorage.getItem("retl_thinking_level") || "off");
 
   // Load providers from backend on mount (后端会自动迁移旧配置)
   useEffect(() => {
@@ -66,6 +68,12 @@ function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("retl_theme", theme);
   }, [theme]);
+
+  // 挂载时把持久化的思考等级同步给后端,之后随切换实时同步
+  useEffect(() => {
+    localStorage.setItem("retl_thinking_level", thinkingLevel);
+    api.setThinkingLevel(thinkingLevel).catch(() => {});
+  }, [thinkingLevel]);
 
   useEffect(() => {
     api.listProjects().then(setProjects).catch(console.error);
@@ -186,6 +194,31 @@ function App() {
         <div className="top-bar">
           <span className="top-bar-title">{pageTitle[page]}</span>
           <div className="top-bar-right">
+            <select
+              className="model-picker"
+              value={thinkingLevel}
+              onChange={e => setThinkingLevel(e.target.value)}
+              title="思考等级：控制模型推理深度（Anthropic thinking / OpenAI reasoning_effort / Gemini thinkingBudget）。模型不支持时请选「关」"
+            >
+              <option value="off">思考·关</option>
+              <option value="low">思考·低</option>
+              <option value="medium">思考·中</option>
+              <option value="high">思考·高</option>
+              <option value="xhigh">思考·超高</option>
+              <option value="max">思考·极限</option>
+            </select>
+            {providers.length > 0 && (
+              <select
+                className="model-picker"
+                value={activeId}
+                onChange={e => setActiveId(e.target.value)}
+                title="切换 LLM 供应商"
+              >
+                {providers.map(p => (
+                  <option key={p.id} value={p.id}>{p.name || p.apiFormat}</option>
+                ))}
+              </select>
+            )}
             {activeProvider && activeModels.length > 0 && (
               <select
                 className="model-picker"
