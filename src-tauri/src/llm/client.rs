@@ -159,9 +159,8 @@ async fn parse_resp(resp: Response) -> Result<(bool, Value), String> {
         return Ok((true, data));
     }
 
-    // Detect SSE streaming response (lines starting with "data:" or "event:"
-    let first_line = text.lines().next().unwrap_or("").trim();
-    if first_line.starts_with("data:") || first_line.starts_with("event: ") {
+    // Detect SSE streaming response, tolerating relay keepalive preambles.
+    if looks_like_sse_stream(&text) {
         return parse_sse_to_openai_response(&text);
     }
 
@@ -171,6 +170,18 @@ async fn parse_resp(resp: Response) -> Result<(bool, Value), String> {
         "API 响应格式无法解析\nURL: {}\n响应预览: {}",
         redact_url_secrets(&url), preview
     ))
+}
+
+/// True when the body looks like an SSE stream. Some relays prepend
+/// comment/keepalive lines（": keepalive"）before the first event, so checking
+/// ONLY the first line misclassifies a valid stream as garbage — scan the
+/// first few non-empty lines for any SSE field instead.
+fn looks_like_sse_stream(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(10)
+        .any(|l| l.starts_with("data:") || l.starts_with("event:"))
 }
 
 /// Reassemble an SSE streaming response into a single Anthropic-compatible JSON object.
@@ -1997,6 +2008,18 @@ fn parse_json_from_text(text: &str) -> Result<Value, String> {
     let json_str = strip_json_fences(text.trim()).trim();
     if let Some(obj_start) = json_str.find('{') {
         let fragment = &json_str[obj_start..];
+        // Some models/relays drop a string's OPENING quote while keeping the
+        // closing one（"title":暗桩临城"）。同一请求重试也会复现，只能本地修复。
+        if let Some(fixed) = repair_missing_open_quotes(fragment) {
+            if let Ok(val) = serde_json::from_str::<Value>(&fixed) {
+                eprintln!("[LlmClient] JSON repair 成功（补回缺失的字符串开引号）");
+                return Ok(val);
+            }
+            // The fixed text may additionally be truncated — close brackets on it.
+            if let Ok(val) = repair_truncated_json(&fixed) {
+                return Ok(val);
+            }
+        }
         if let Ok(val) = repair_truncated_json(fragment) {
             return Ok(val);
         }
@@ -2174,6 +2197,72 @@ fn repair_truncated_json(text: &str) -> Result<Value, String> {
     Err("JSON repair failed: no safe truncation point parses".to_string())
 }
 
+/// Repair a corruption some models/relays emit: a string missing its OPENING
+/// quote while its closing quote survives（`"title":绝境将至",` 应为
+/// `"title":"绝境将至",`）。Walks with a string-aware state machine; wherever a
+/// key/value must start (right after `{` `[` `,` `:`) but the byte cannot
+/// legally begin any JSON token, the quote was dropped — re-insert it and
+/// enter in-string state so the surviving closing quote terminates it.
+/// Limitation: raw text starting with an ASCII byte that looks like a legal
+/// token start（digit / `-` / `t` / `f` / `n`）is not detectable; all observed
+/// corruption starts with a CJK character, which is unambiguous.
+/// Returns None when nothing needed fixing.
+fn repair_missing_open_quotes(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
+    let mut in_string = false;
+    let mut escape = false;
+    let mut expect_token = false; // a key or value must start here
+    let mut fixed = false;
+
+    for &c in bytes {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                escape = false;
+                expect_token = false;
+                out.push(c);
+            }
+            b'{' | b'[' | b',' | b':' => {
+                expect_token = true;
+                out.push(c);
+            }
+            b'}' | b']' => {
+                expect_token = false;
+                out.push(c);
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => out.push(c),
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                expect_token = false;
+                out.push(c);
+            }
+            _ => {
+                if expect_token {
+                    out.push(b'"');
+                    in_string = true;
+                    escape = false;
+                    fixed = true;
+                }
+                expect_token = false;
+                out.push(c);
+            }
+        }
+    }
+
+    if fixed { String::from_utf8(out).ok() } else { None }
+}
+
 /// Redact secrets that may appear in a URL before logging or surfacing to the UI:
 /// the `key=` query parameter value (Gemini) and any `user:pass@` userinfo.
 fn redact_url_secrets(url: &str) -> String {
@@ -2268,5 +2357,101 @@ mod tests {
         assert!(parse_json_strict(r#"{"a":1,"b""#).is_none());
         assert!(parse_json_strict(r#"{"a":1}"#).is_some());
         assert!(parse_json_strict("```json\n{\"a\":1}\n```").is_some());
+    }
+
+    // The bug this guards against: some relays drop a string value's opening
+    // quote（"title":绝境将至"）— every retry reproduced it, so the parse must
+    // repair it locally.
+    #[test]
+    fn missing_open_quote_on_value() {
+        let fixed = repair_missing_open_quotes(r#"{"number":62,"title":绝境将至","summary":"暗桩查探"}"#).unwrap();
+        let v: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["title"], "绝境将至");
+        assert_eq!(v["number"], 62);
+        assert_eq!(v["summary"], "暗桩查探");
+    }
+
+    #[test]
+    fn missing_open_quote_on_key_and_in_array() {
+        let fixed = repair_missing_open_quotes(r#"{标题":"a","tags":["x",伏笔"]}"#).unwrap();
+        let v: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["标题"], "a");
+        assert_eq!(v["tags"][1], "伏笔");
+    }
+
+    #[test]
+    fn missing_open_quote_multiple_occurrences() {
+        let fixed = repair_missing_open_quotes(
+            r#"{"chapters":[{"n":59,"title":暗桩临城","ok":true},{"n":60,"title":截流之疾","ok":false}]}"#,
+        ).unwrap();
+        let v: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["chapters"][0]["title"], "暗桩临城");
+        assert_eq!(v["chapters"][1]["title"], "截流之疾");
+        assert_eq!(v["chapters"][1]["ok"], false);
+    }
+
+    #[test]
+    fn missing_open_quote_untouched_when_valid() {
+        // Valid JSON (numbers, bools, null, nested, CJK inside strings) must
+        // pass through unmodified — None means "nothing to fix".
+        assert!(repair_missing_open_quotes(
+            r#"{"a":1.5,"b":true,"c":null,"d":[-2,{"e":"文:本,含」符"}]}"#
+        ).is_none());
+    }
+
+    #[test]
+    fn missing_open_quote_then_truncated() {
+        // Corruption AND truncation in the same response: fix quotes first,
+        // then the bracket-closing repair salvages the complete chapters.
+        let broken = r#"{"chapters":[{"n":59,"title":暗桩临城"},{"n":60,"title":"截流"#;
+        let fixed = repair_missing_open_quotes(broken).unwrap();
+        let v = repair_truncated_json(&fixed).unwrap();
+        assert_eq!(v["chapters"][0]["title"], "暗桩临城");
+    }
+
+    #[test]
+    fn parse_json_from_text_repairs_missing_quote_end_to_end() {
+        let v = parse_json_from_text(r#"{"number":62,"title":绝境将至","x":1}"#).unwrap();
+        assert_eq!(v["title"], "绝境将至");
+        assert_eq!(v["x"], 1);
+    }
+
+    // The bug this guards against: a relay stream opening with ": keepalive"
+    // comment lines was not recognized as SSE (only line one was checked) and
+    // surfaced as "API 响应格式无法解析".
+    #[test]
+    fn sse_detected_behind_keepalive_preamble() {
+        let body = ": keepalive\n\nevent: ping\ndata: {\"type\": \"ping\"}\n\n: keepalive\n\nevent: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_1\"}}\n";
+        assert!(looks_like_sse_stream(body));
+        assert!(looks_like_sse_stream("data: {\"a\":1}\n"));
+        assert!(looks_like_sse_stream("event: message_start\ndata: {}\n"));
+        assert!(!looks_like_sse_stream("<html>502 Bad Gateway</html>"));
+        assert!(!looks_like_sse_stream("纯文本错误信息"));
+    }
+
+    #[test]
+    fn sse_reassembly_with_keepalive_comments() {
+        let body = concat!(
+            ": keepalive\n\n",
+            "event: ping\ndata: {\"type\": \"ping\"}\n\n",
+            ": keepalive\n\n",
+            "event: message_start\n",
+            "data: {\"message\":{\"content\":[],\"id\":\"msg_1\",\"model\":\"claude-opus-4.8\",\"role\":\"assistant\",\"type\":\"message\",\"usage\":{}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"苏落霜\"}}\n\n",
+            ": keepalive\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"行至裂隙边缘\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (ok, data) = parse_sse_to_openai_response(body).unwrap();
+        assert!(ok);
+        let text = extract_claude_text(&data).unwrap();
+        assert_eq!(text, "苏落霜行至裂隙边缘");
     }
 }
