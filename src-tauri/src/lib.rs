@@ -201,8 +201,9 @@ fn build_constraints_text(constraints: Option<&Value>) -> String {
             .collect();
         if !user_prompts.is_empty() {
             let mut text = String::from("## 必须应用的提示词\n");
-            // 6 = 自动匹配的风格提示词（最多 3 条）+ 手动勾选的审校/自定义（最多 3 条）
-            for prompt in user_prompts.iter().take(6) {
+            // 不设条数上限:选中/匹配到的全部注入,由用户自行控制勾选数量;
+            // 单条 800 字截断仍保留,防止个别超长提示词挤爆上下文。
+            for prompt in user_prompts.iter() {
                 let title = prompt["title"].as_str().unwrap_or("未命名提示词");
                 let category = prompt["category"].as_str().unwrap_or("未分类");
                 let content = prompt["content"].as_str().unwrap_or("");
@@ -1480,6 +1481,16 @@ fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, pro
 #[tauri::command]
 fn set_thinking_level(level: String) {
     *THINKING_LEVEL.lock().unwrap() = level;
+}
+
+#[tauri::command]
+fn get_prompts() -> Result<Option<Value>, String> {
+    storage::load_user_prompts()
+}
+
+#[tauri::command]
+fn save_prompts(data: Value) -> Result<(), String> {
+    storage::save_user_prompts(&data)
 }
 
 #[tauri::command]
@@ -3224,6 +3235,8 @@ pub fn run() {
             save_llm_providers,
             get_llm_providers,
             set_thinking_level,
+            get_prompts,
+            save_prompts,
             agent_chat,
             agent_chat_stream,
             cancel_agent_chat,

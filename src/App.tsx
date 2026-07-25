@@ -16,6 +16,7 @@ import { OutlineImporter } from "./components/OutlineImporter";
 import { AgentChat } from "./components/AgentChat";
 import { CreateProjectDialog } from "./components/CreateProjectDialog";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { initPromptStore } from "./utils/promptStore";
 import "./App.css";
 
 type Page = "dashboard" | "novels" | "chapters" | "editor" | "settings" | "chat" | "prompts" | "goals" | "genres" | "skills" | "mcp" | "agent";
@@ -77,6 +78,8 @@ function App() {
 
   useEffect(() => {
     api.listProjects().then(setProjects).catch(console.error);
+    // 提示词库:从数据目录 prompts.json 加载(首次自动从 localStorage 迁移落盘)
+    initPromptStore().catch(() => {});
   }, []);
 
   // Persist providers to backend when they change (debounced, skip initial load)
@@ -116,6 +119,8 @@ function App() {
   };
 
   const handleNewProjectChat = () => {
+    // 每次从「AI 对话创建」进入都是全新会话:选错类型/中途放弃后重进不应残留旧对话
+    setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
     setPage("chat");
   };
 
@@ -303,7 +308,11 @@ function App() {
                 draft={chatDraft}
                 onDraftChange={setChatDraft}
                 onProjectCreated={handleProjectCreated}
-                onCancel={() => setPage(currentProject ? "chapters" : "dashboard")}
+                onCancel={() => {
+                  // 取消即放弃本次创建:清空草稿并回首页(创建入口在首页,不回章节管理)
+                  setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
+                  setPage("dashboard");
+                }}
               />
             )}
             {page === "prompts" && <PromptLibrary />}

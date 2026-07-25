@@ -606,6 +606,41 @@ pub fn load_llm_profiles() -> Result<Option<Value>, String> {
     Ok(Some(val))
 }
 
+// ===== 提示词库(prompts.json)=====
+//
+// 数据结构:{ "version": "v3", "prompts": [ {id, title, category, content} ] }
+// 之前存在前端 localStorage(WebView 内部,清缓存即丢),迁移为数据目录文件,
+// 与项目/LLM 配置一致,可随数据目录备份迁移。
+
+fn prompts_path() -> PathBuf {
+    app_root_dir().join("prompts.json")
+}
+
+pub fn load_user_prompts() -> Result<Option<Value>, String> {
+    let path = prompts_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map(Some).map_err(|e| e.to_string())
+}
+
+/// 原子写,避免写一半崩溃留下损坏的 JSON。
+pub fn save_user_prompts(data: &Value) -> Result<(), String> {
+    let dir = app_root_dir();
+    let content = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+    let tmp_path = dir.join(".prompts.json.tmp");
+    fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    let path = prompts_path();
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("重命名文件失败: {}", e)
+    })
+}
+
 // ===== 多供应商配置(providers)=====
 //
 // 数据结构:llm_providers.json = { "activeId": "<uuid>", "providers": [ {..} ] }

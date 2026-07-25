@@ -337,6 +337,9 @@ export const api = {
   getLlmProviders: () => invoke<LlmProvidersData | null>("get_llm_providers"),
   // 思考等级："off" | "low" | "medium" | "high"，后端全局生效于所有写作类 LLM 调用
   setThinkingLevel: (level: string) => invoke("set_thinking_level", { level }),
+  // 提示词库(数据目录 prompts.json):{ version, prompts }
+  getPrompts: () => invoke<{ version?: string; prompts?: unknown[] } | null>("get_prompts"),
+  savePrompts: (data: { version: string; prompts: unknown[] }) => invoke("save_prompts", { data }),
 
   createProject: (data: {
     title: string; genre: string; premise: string;

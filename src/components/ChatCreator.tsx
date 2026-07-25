@@ -131,7 +131,7 @@ export function ChatCreator({ llm, draft, onDraftChange, onProjectCreated, onCan
         <button className="cancel-btn" onClick={onCancel}>取消</button>
       </div>
       <div className="chat-constraints-wrap">
-        <CreativeConstraintsPanel collapsible defaultCollapsed />
+        <CreativeConstraintsPanel collapsible defaultCollapsed genre={genre || undefined} />
       </div>
       {error && <div className="error" style={{ margin: "0 20px" }}>{error}</div>}
       <div className="chat-messages">

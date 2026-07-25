@@ -47,17 +47,23 @@ const GENRE_KEY_ALIASES: Record<string, string> = {
 };
 
 // 类型关键词 → 默认提示词 id（对应 PromptLibrary 的内置提示词）
+// 注意顺序:更具体的子类型规则放前面(如「都市修仙」须先于「修仙」命中)
 const GENRE_PROMPT_RULES: { keywords: string[]; promptIds: string[] }[] = [
+  // 都市+超凡子类:现代都市场景 + 对应战斗风格 + 冲突对话
+  { keywords: ["都市修仙", "都市修真", "都市灵异"], promptIds: ["d2", "d5b", "d3"] },
+  { keywords: ["都市异能", "都市高武", "兵王", "战神", "特种兵"], promptIds: ["d2", "d5c", "d3"] },
+  { keywords: ["电竞", "竞技", "体育"], promptIds: ["d2", "d5d", "d3c"] },
   { keywords: ["武侠", "江湖"], promptIds: ["d1", "d5"] },
-  { keywords: ["玄幻", "仙侠", "修真", "修仙", "奇幻", "异世界"], promptIds: ["d2b", "d5b", "d10b"] },
+  { keywords: ["玄幻", "仙侠", "修真", "修仙", "奇幻", "异世界"], promptIds: ["d2b", "d5b", "d10b", "d7e"] },
   { keywords: ["科幻", "未来", "星际", "赛博", "太空"], promptIds: ["d2c", "d6"] },
   { keywords: ["言情", "爱情", "甜宠", "虐恋", "浪漫", "恋爱"], promptIds: ["d3b", "d7", "d10"] },
   { keywords: ["悬疑", "推理", "侦探", "犯罪"], promptIds: ["d9b", "d6b"] },
   { keywords: ["历史", "王朝", "宫廷", "古代"], promptIds: ["d1", "d3d", "d10b"] },
   { keywords: ["恐怖", "灵异", "惊悚", "怪谈"], promptIds: ["d9", "d7d"] },
-  { keywords: ["游戏", "网游", "电竞", "无限流"], promptIds: ["d2b", "d5b"] },
+  { keywords: ["游戏", "网游", "无限流"], promptIds: ["d2b", "d5b"] },
   { keywords: ["末日", "废土", "丧尸", "求生"], promptIds: ["d2c", "d7d"] },
-  { keywords: ["都市", "职场", "商战", "现代"], promptIds: ["d2", "d3", "d3d"] },
+  // 都市大类:场景 + 对话(冲突/谈判) + 战斗(心理博弈) + 氛围(市井烟火)
+  { keywords: ["都市", "职场", "商战", "现代", "赘婿", "神医", "鉴宝", "娱乐圈"], promptIds: ["d2", "d3", "d3d", "d6b", "d10c"] },
 ];
 
 /** 解析项目 genre（内置 key / 自定义类型的 id 或名称）为可做关键词匹配的名称 */

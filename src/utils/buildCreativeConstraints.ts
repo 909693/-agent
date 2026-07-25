@@ -8,8 +8,8 @@ export async function buildCreativeConstraintsPayload(genre?: string): Promise<C
   const state = getCreativeConstraints();
   const allStoredPrompts = loadPrompts();
   const effectiveIds = resolveEffectivePromptIds(state, genre, allStoredPrompts);
-  // Keep effectiveIds order (auto-matched style prompts first) — the backend
-  // caps the injected prompt count, so ordering decides what survives.
+  // 后端不限制注入条数,选中/匹配到的提示词全部生效(保持 effectiveIds 顺序:
+  // 自动匹配的风格词在前,手动勾选在后)。
   const prompts = effectiveIds
     .map((id) => allStoredPrompts.find((p) => p.id === id))
     .filter((p): p is NonNullable<typeof p> => !!p);
