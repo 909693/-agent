@@ -437,8 +437,8 @@ impl LlmClient {
         }
     }
 
-    /// Token budget per thinking level (shared by Anthropic budget_tokens and
-    /// Gemini thinkingBudget).
+    /// Token allowance per thinking level — used as Anthropic max_tokens 余量
+    /// and as Gemini thinkingBudget.
     fn thinking_budget(level: &str) -> u32 {
         match level {
             "low" => 2048,
@@ -457,22 +457,24 @@ impl LlmClient {
         })
     }
 
-    /// Anthropic thinking params: (thinking block, effective max_tokens, temperature).
-    /// With thinking enabled the API requires budget_tokens < max_tokens（思考
-    /// 从 max_tokens 池里扣）and temperature = 1，so both are adjusted here.
-    /// 总量夹到 64k：更高档位在输出上限较小的模型上会被 API 拒绝。
-    fn claude_thinking_params(&self, max_tokens: u32, default_temp: f64) -> (Value, u32, f64) {
+    /// Anthropic 思考参数（Opus 4.7+ 语义）。budget_tokens 在 4.7+ 已被移除
+    /// （官方 API 400，中转站静默忽略——表现为"思考档位不生效"），真正的控制杆
+    /// 是 adaptive thinking + output_config.effort，且档位枚举与本应用一致
+    /// （low/medium/high/xhigh/max）。开启思考时 temperature 等采样参数同样被
+    /// 4.7+ 拒收，故不发送；并给 max_tokens 追加按档位的余量（思考从
+    /// max_tokens 池里扣），总量夹 64k。关闭时保持旧行为（disabled + temperature）。
+    fn apply_claude_thinking(&self, body: &mut Value, max_tokens: u32, default_temp: f64) {
         match self.thinking_level() {
             Some(level) => {
-                let budget = Self::thinking_budget(level);
-                let eff_max = (max_tokens + budget).min(64_000);
-                (
-                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
-                    eff_max,
-                    1.0,
-                )
+                body["thinking"] = serde_json::json!({"type": "adaptive"});
+                body["output_config"] = serde_json::json!({"effort": level});
+                body["max_tokens"] =
+                    serde_json::json!((max_tokens + Self::thinking_budget(level)).min(64_000));
             }
-            None => (serde_json::json!({"type": "disabled"}), max_tokens, default_temp),
+            None => {
+                body["thinking"] = serde_json::json!({"type": "disabled"});
+                body["temperature"] = serde_json::json!(default_temp);
+            }
         }
     }
 
@@ -703,16 +705,14 @@ impl LlmClient {
         let model_name = self.config.model
             .replace("-thinking", "")
             .replace("-cc", "");
-        let (thinking, eff_max_tokens, temperature) = self.claude_thinking_params(max_tokens, 0.7);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_name,
-            "max_tokens": eff_max_tokens,
-            "temperature": temperature,
-            "thinking": thinking,
+            "max_tokens": max_tokens,
             "stream": true,
             "system": system_prompt,
             "messages": msgs,
         });
+        self.apply_claude_thinking(&mut body, max_tokens, 0.7);
         let url = self.claude_url();
         let resp = self
             .http
@@ -895,16 +895,14 @@ impl LlmClient {
         let model_name = self.config.model
             .replace("-thinking", "")
             .replace("-cc", "");
-        let (thinking, eff_max_tokens, temperature) = self.claude_thinking_params(max_tokens, 0.3);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_name,
-            "max_tokens": eff_max_tokens,
-            "temperature": temperature,
-            "thinking": thinking,
+            "max_tokens": max_tokens,
             "stream": true,
             "system": system_prompt,
             "messages": [{"role": "user", "content": format!("{user_prompt}\n\nIMPORTANT: Return ONLY valid JSON, no tool calls, no commentary. Direct JSON output only.")}],
         });
+        self.apply_claude_thinking(&mut body, max_tokens, 0.3);
         let url = self.claude_url();
 
         let (ok, data) = self.post_json_retry(&url, &[
