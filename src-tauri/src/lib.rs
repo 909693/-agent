@@ -1457,7 +1457,30 @@ async fn get_tomato_config() -> Result<Value, String> {
 
 #[tauri::command]
 async fn save_tomato_config(config: Value) -> Result<(), String> {
-    storage::save_tomato_config(&config)
+    storage::save_tomato_config(&config)?;
+
+    // 同步登记到「MCP 管理」服务列表,便于统一查看/启停。发布流程本身
+    // 走内部临时进程,不依赖这条记录;Cookie/CSRF 只存 secrets,不进注册表 env。
+    let script = config["script"].as_str().unwrap_or("").trim().to_string();
+    if !script.is_empty() {
+        let node = config["nodePath"].as_str().unwrap_or("").trim();
+        let node = if node.is_empty() { "node" } else { node };
+        let cwd = std::path::Path::new(&script)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        plugins::save_mcp_server(json!({
+            "id": "tomato-writer-mcp",
+            "name": "番茄小说发布（tomato-writer-mcp）",
+            "command": node,
+            "args": [script],
+            "cwd": cwd,
+            "enabled": true,
+        }))
+        .map_err(|e| format!("配置已保存,但登记到 MCP 管理列表失败: {}", e))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

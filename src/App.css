@@ -3154,3 +3154,15 @@ body {
   cursor: pointer;
 }
 .top-bar-model:hover { border-color: var(--text-secondary); }
+
+/* ===== 不透明弹窗变体 ===== */
+/* 双层玻璃(overlay blur + modal 自身 blur)叠在内容密集页上既透底又费 GPU,
+   发布这类长表单弹窗用实底,滚动交给内部 body 区。 */
+.modal.modal-solid {
+  background: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: hidden;
+  padding: 0;
+  gap: 0;
+}

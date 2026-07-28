@@ -59,6 +59,7 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
   const [published, setPublished] = useState(false);
   const [error, setError] = useState("");
   const armTimer = useRef<number | null>(null);
+  const resultEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     api.getTomatoConfig().then((c) => {
@@ -76,6 +77,11 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
     }).catch((e) => { setError(String(e)); setConfigLoaded(true); setShowConfig(true); });
     return () => { if (armTimer.current) window.clearTimeout(armTimer.current); };
   }, []);
+
+  // 结果/报错出现时滚到可见位置(滚动在 body 区内部)
+  useEffect(() => {
+    if (result || error) resultEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [result, error]);
 
   const disarm = () => {
     setArmed(false);
@@ -159,105 +165,117 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ width: 560, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>发布到番茄小说</h3>
-        <div className="dim" style={{ fontSize: 13, marginBottom: 16 }}>
-          第{chapterNumber}章 · {chapterWords} 字 · 经本机 tomato-writer-mcp 提交到番茄作家后台
+      <div
+        className="modal modal-solid"
+        style={{ width: 560, maxHeight: "85vh", display: "flex", flexDirection: "column" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 固定头部 */}
+        <div style={{ padding: "20px 24px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <h3 style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>发布到番茄小说</h3>
+          <div className="dim" style={{ fontSize: 13, marginTop: 4 }}>
+            第{chapterNumber}章 · {chapterWords} 字 · 经本机 tomato-writer-mcp 提交到番茄作家后台
+          </div>
         </div>
 
-        {/* 鉴权与 MCP 配置 */}
-        <div style={{ marginBottom: 16 }}>
-          <button className="btn-sm" onClick={() => setShowConfig(!showConfig)}>
-            {showConfig ? "收起配置 ▲" : "发布配置（MCP 路径 / 鉴权）▼"}
-          </button>
-          {showConfig && (
-            <div style={{ marginTop: 10, padding: 12, border: "1px solid var(--border)", borderRadius: "var(--radius)", display: "flex", flexDirection: "column", gap: 10 }}>
-              <div>
-                <div style={labelStyle}>MCP 脚本路径（tomato-writer-mcp/dist/index.js）</div>
-                <input style={inputStyle} value={config.script} placeholder="/Users/you/Documents/mcp/dist/index.js"
-                  onChange={(e) => setConfig({ ...config, script: e.target.value })} />
-              </div>
-              <div>
-                <div style={labelStyle}>node 路径（留空自动从 PATH / Homebrew 查找）</div>
-                <input style={inputStyle} value={config.nodePath} placeholder="node"
-                  onChange={(e) => setConfig({ ...config, nodePath: e.target.value })} />
-              </div>
-              <div>
-                <div style={labelStyle}>番茄作家后台 Cookie（浏览器登录后从 /api/author/ 请求头复制）</div>
-                <input type="password" style={inputStyle} value={config.cookie} placeholder="粘贴完整 Cookie 头"
-                  onChange={(e) => setConfig({ ...config, cookie: e.target.value })} />
-              </div>
-              <div>
-                <div style={labelStyle}>X-Secsdk-Csrf-Token</div>
-                <input type="password" style={inputStyle} value={config.csrfToken} placeholder="同一请求头里的 X-Secsdk-Csrf-Token"
-                  onChange={(e) => setConfig({ ...config, csrfToken: e.target.value })} />
-              </div>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <button className="btn-primary" onClick={handleSaveConfig} disabled={configStatus === "saving"}>
-                  {configStatus === "saving" ? <><span className="loading-spinner" />保存中...</> : "保存配置"}
-                </button>
-                {configStatus === "saved" && <span className="saved-tag">✓ 已保存（Cookie 加密落盘）</span>}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* 目标书目 */}
-        <div style={{ marginBottom: 14 }}>
-          <div style={labelStyle}>目标书目</div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {novels.length > 0 ? (
-              <select style={{ ...inputStyle, flex: 1 }} value={bookId} onChange={(e) => { setBookId(e.target.value); disarm(); }}>
-                {novels.map((n) => (
-                  <option key={n.bookId} value={n.bookId}>《{n.name}》（{n.bookId}）</option>
-                ))}
-              </select>
-            ) : (
-              <input style={{ ...inputStyle, flex: 1 }} value={bookId} placeholder="book_id（留空则用 MCP 当前选中/账号第一本）"
-                onChange={(e) => { setBookId(e.target.value); disarm(); }} />
-            )}
-            <button className="btn-outline" onClick={handleLoadNovels} disabled={loadingNovels || !configLoaded}>
-              {loadingNovels ? <><span className="loading-spinner" />加载中</> : novels.length > 0 ? "刷新书目" : "加载书目"}
+        {/* 可滚动内容区 */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px 24px" }}>
+          {/* 鉴权与 MCP 配置 */}
+          <div style={{ marginBottom: 16 }}>
+            <button className="btn-sm" onClick={() => setShowConfig(!showConfig)}>
+              {showConfig ? "收起配置 ▲" : "发布配置（MCP 路径 / 鉴权）▼"}
             </button>
+            {showConfig && (
+              <div style={{ marginTop: 10, padding: 12, border: "1px solid var(--border)", borderRadius: "var(--radius)", display: "flex", flexDirection: "column", gap: 10 }}>
+                <div>
+                  <div style={labelStyle}>MCP 脚本路径（tomato-writer-mcp/dist/index.js）</div>
+                  <input style={inputStyle} value={config.script} placeholder="/Users/you/Documents/mcp/dist/index.js"
+                    onChange={(e) => setConfig({ ...config, script: e.target.value })} />
+                </div>
+                <div>
+                  <div style={labelStyle}>node 路径（留空自动从 PATH / Homebrew 查找）</div>
+                  <input style={inputStyle} value={config.nodePath} placeholder="node"
+                    onChange={(e) => setConfig({ ...config, nodePath: e.target.value })} />
+                </div>
+                <div>
+                  <div style={labelStyle}>番茄作家后台 Cookie（浏览器登录后从 /api/author/ 请求头复制）</div>
+                  <input type="password" style={inputStyle} value={config.cookie} placeholder="粘贴完整 Cookie 头"
+                    onChange={(e) => setConfig({ ...config, cookie: e.target.value })} />
+                </div>
+                <div>
+                  <div style={labelStyle}>X-Secsdk-Csrf-Token</div>
+                  <input type="password" style={inputStyle} value={config.csrfToken} placeholder="同一请求头里的 X-Secsdk-Csrf-Token"
+                    onChange={(e) => setConfig({ ...config, csrfToken: e.target.value })} />
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button className="btn-primary" onClick={handleSaveConfig} disabled={configStatus === "saving"}>
+                    {configStatus === "saving" ? <><span className="loading-spinner" />保存中...</> : "保存配置"}
+                  </button>
+                  {configStatus === "saved" && <span className="saved-tag">✓ 已保存（Cookie 加密落盘，并登记到 MCP 管理）</span>}
+                </div>
+              </div>
+            )}
           </div>
-          {novelsRaw && novels.length > 0 && (
-            <div className="dim" style={{ fontSize: 12, marginTop: 4 }}>共 {novels.length} 本</div>
-          )}
-        </div>
 
-        {/* 章节标题 */}
-        <div style={{ marginBottom: 14 }}>
-          <div style={labelStyle}>发布标题</div>
-          <input style={inputStyle} value={title} onChange={(e) => { setTitle(e.target.value); disarm(); }} />
-        </div>
-
-        {/* 定时与 AI 申报 */}
-        <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 14 }}>
-          <div>
-            <div style={labelStyle}>定时发布（留空立即发布）</div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input type="datetime-local" style={inputStyle} value={publishTime}
-                onChange={(e) => { setPublishTime(e.target.value); disarm(); }} />
-              {publishTime && <button className="btn-sm" onClick={() => { setPublishTime(""); disarm(); }}>清除</button>}
+          {/* 目标书目 */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={labelStyle}>目标书目</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {novels.length > 0 ? (
+                <select style={{ ...inputStyle, flex: 1 }} value={bookId} onChange={(e) => { setBookId(e.target.value); disarm(); }}>
+                  {novels.map((n) => (
+                    <option key={n.bookId} value={n.bookId}>《{n.name}》（{n.bookId}）</option>
+                  ))}
+                </select>
+              ) : (
+                <input style={{ ...inputStyle, flex: 1 }} value={bookId} placeholder="book_id（留空则用 MCP 当前选中/账号第一本）"
+                  onChange={(e) => { setBookId(e.target.value); disarm(); }} />
+              )}
+              <button className="btn-outline" onClick={handleLoadNovels} disabled={loadingNovels || !configLoaded}>
+                {loadingNovels ? <><span className="loading-spinner" />加载中</> : novels.length > 0 ? "刷新书目" : "加载书目"}
+              </button>
             </div>
+            {novelsRaw && novels.length > 0 && (
+              <div className="dim" style={{ fontSize: 12, marginTop: 4 }}>共 {novels.length} 本</div>
+            )}
           </div>
-          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, cursor: "pointer", marginTop: 18 }}>
-            <input type="checkbox" checked={useAi} onChange={(e) => { setUseAi(e.target.checked); disarm(); }} />
-            申报「使用 AI 创作」
-          </label>
+
+          {/* 章节标题 */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={labelStyle}>发布标题</div>
+            <input style={inputStyle} value={title} onChange={(e) => { setTitle(e.target.value); disarm(); }} />
+          </div>
+
+          {/* 定时与 AI 申报 */}
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 14 }}>
+            <div>
+              <div style={labelStyle}>定时发布（留空立即发布）</div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="datetime-local" style={inputStyle} value={publishTime}
+                  onChange={(e) => { setPublishTime(e.target.value); disarm(); }} />
+                {publishTime && <button className="btn-sm" onClick={() => { setPublishTime(""); disarm(); }}>清除</button>}
+              </div>
+            </div>
+            <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, cursor: "pointer", paddingBottom: 8 }}>
+              <input type="checkbox" checked={useAi} onChange={(e) => { setUseAi(e.target.checked); disarm(); }} />
+              申报「使用 AI 创作」
+            </label>
+          </div>
+
+          {error && <div className="error" style={{ whiteSpace: "pre-wrap" }}>{error}</div>}
+          {result && (
+            <div style={{
+              background: published ? "var(--success-light)" : "var(--bg-soft)",
+              border: `1px solid ${published ? "var(--success)" : "var(--border)"}`,
+              borderRadius: "var(--radius)", padding: "10px 14px", marginBottom: 4,
+              fontSize: 13, whiteSpace: "pre-wrap", wordBreak: "break-all",
+            }}>{result}</div>
+          )}
+          <div ref={resultEndRef} />
         </div>
 
-        {error && <div className="error" style={{ whiteSpace: "pre-wrap" }}>{error}</div>}
-        {result && (
-          <div style={{
-            background: published ? "var(--success-light)" : "var(--bg-secondary, rgba(127,127,127,0.08))",
-            border: `1px solid ${published ? "var(--success)" : "var(--border)"}`,
-            borderRadius: "var(--radius)", padding: "10px 14px", marginBottom: 14,
-            fontSize: 13, whiteSpace: "pre-wrap", wordBreak: "break-all",
-          }}>{result}</div>
-        )}
-
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
+        {/* 固定底栏 */}
+        <div style={{ padding: "12px 24px 18px", borderTop: "1px solid var(--border)", flexShrink: 0, display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
           {armed && <span className="dim" style={{ fontSize: 12 }}>再点一次确认提交，5 秒后自动取消</span>}
           <button className="btn-outline" onClick={onClose}>关闭</button>
           {!published && (
