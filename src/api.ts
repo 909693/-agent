@@ -73,6 +73,17 @@ export interface McpTestResult {
   logExcerpt: string;
 }
 
+// 番茄小说发布配置(tomato-writer-mcp)。cookie/csrfToken 后端落 secrets,
+// JSON 文件里只存占位符。
+export interface TomatoConfig {
+  nodePath: string;      // node 可执行文件,留空用 PATH 里的 node
+  script: string;        // tomato-writer-mcp 的 dist/index.js 绝对路径
+  cookie: string;        // 番茄作家后台 Cookie
+  csrfToken: string;     // X-Secsdk-Csrf-Token
+  defaultBookId?: string;
+  useAi?: boolean;       // 发布时是否申报「使用 AI 创作」
+}
+
 export interface CreativeConstraintsPayload {
   mode: "strict" | "assist";
   skills: Array<{ id: string; name: string; content: string }>;
@@ -484,4 +495,17 @@ export const api = {
     invoke<McpServerRecord>("stop_mcp_server", { serverId }),
   getMcpLogs: (serverId: string) =>
     invoke<string>("get_mcp_logs", { serverId }),
+
+  // 番茄小说发布
+  getTomatoConfig: () => invoke<TomatoConfig | null>("get_tomato_config"),
+  saveTomatoConfig: (config: TomatoConfig) => invoke("save_tomato_config", { config }),
+  tomatoListNovels: () => invoke<string>("tomato_list_novels"),
+  tomatoPublishChapter: (
+    projectId: string, chapterNumber: number,
+    opts: { bookId?: string; title: string; publishTime?: string; useAi?: boolean; dryRun?: boolean },
+  ) => invoke<string>("tomato_publish_chapter", {
+    projectId, chapterNumber,
+    bookId: opts.bookId, title: opts.title, publishTime: opts.publishTime,
+    useAi: opts.useAi, dryRun: opts.dryRun,
+  }),
 };

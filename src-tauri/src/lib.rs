@@ -1448,6 +1448,50 @@ async fn get_mcp_logs(server_id: String) -> Result<String, String> {
     plugins::get_mcp_logs(server_id)
 }
 
+// ===== 番茄小说发布(tomato-writer-mcp) =====
+
+#[tauri::command]
+async fn get_tomato_config() -> Result<Value, String> {
+    Ok(storage::load_tomato_config()?.unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+async fn save_tomato_config(config: Value) -> Result<(), String> {
+    storage::save_tomato_config(&config)
+}
+
+#[tauri::command]
+async fn tomato_list_novels() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(plugins::tomato::list_novels)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn tomato_publish_chapter(
+    project_id: String,
+    chapter_number: u32,
+    book_id: Option<String>,
+    title: String,
+    publish_time: Option<String>,
+    use_ai: Option<bool>,
+    dry_run: Option<bool>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        plugins::tomato::publish_chapter(
+            &project_id,
+            chapter_number,
+            book_id,
+            &title,
+            publish_time,
+            use_ai.unwrap_or(true),
+            dry_run.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, proxy_url: Option<String>, user_agent: Option<String>) -> LlmClient {
     let default_model = match api_format {
         "anthropic" => "claude-sonnet-4-20250514",
@@ -3297,6 +3341,10 @@ pub fn run() {
             start_mcp_server,
             stop_mcp_server,
             get_mcp_logs,
+            get_tomato_config,
+            save_tomato_config,
+            tomato_list_novels,
+            tomato_publish_chapter,
         ])
         .setup(|_app| {
             // Register cleanup handler for MCP servers on app exit

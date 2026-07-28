@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type ProjectMeta, type LlmParams, type PlotProgress } from "../api";
 import { startBatch, cancelBatch, subscribeBatch, getBatchState, BATCH_CHUNK_SIZE } from "../utils/batchController";
 import { ExportDialog } from "./ExportDialog";
+import { PublishDialog } from "./PublishDialog";
 import { CreativeConstraintsPanel } from "./CreativeConstraintsPanel";
 import { buildCreativeConstraintsPayload } from "../utils/buildCreativeConstraints";
 import { parseOutlineToPlot } from "../utils/outlineParser";
@@ -35,6 +36,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [error, setError] = useState("");
   const [chapterTexts, setChapterTexts] = useState<Record<number, string>>({});
   const [showExport, setShowExport] = useState(false);
+  const [publishTarget, setPublishTarget] = useState<{ number: number; title: string } | null>(null);
   const [outlineText, setOutlineText] = useState("");
   const [outlineName, setOutlineName] = useState("");
   const [outlineStatus, setOutlineStatus] = useState<"idle" | "saving" | "saved">("idle");
@@ -894,6 +896,11 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
                             {summarizingChapters.has(ch.number) ? <span className="loading-spinner" /> : summaries?.[String(ch.number)] ? "已摘要" : "摘要"}
                           </button>
                         )}
+                        {written && (
+                          <button className="btn-sm" onClick={() => setPublishTarget({ number: ch.number, title: ch.title })} title="发布到番茄小说">
+                            发布
+                          </button>
+                        )}
                         <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "up")} disabled={idx === 0 || bs.running} title="上移">↑</button>
                         <button className="btn-sm move-btn" onClick={() => handleMoveChapter(idx, "down")} disabled={idx === allChapters.length - 1 || bs.running} title="下移">↓</button>
                       </td>
@@ -1085,6 +1092,15 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
           projectId={project.id}
           projectTitle={project.title}
           onClose={() => setShowExport(false)}
+        />
+      )}
+      {publishTarget && (
+        <PublishDialog
+          projectId={project.id}
+          chapterNumber={publishTarget.number}
+          chapterTitle={publishTarget.title}
+          chapterWords={(chapterTexts[publishTarget.number] || "").length}
+          onClose={() => setPublishTarget(null)}
         />
       )}
     </div>

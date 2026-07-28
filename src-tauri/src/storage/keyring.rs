@@ -120,10 +120,12 @@ pub fn delete_api_key(provider: &str) -> Result<(), String> {
 }
 
 /// 只保留 valid_ids 中的键,删除其余(供应商被删除后清理孤儿 key)。
+/// "app:" 前缀是保留命名空间(非供应商的应用级凭证,如番茄发布 Cookie),
+/// 不随供应商列表清理。
 pub fn prune_keys(valid_ids: &[String]) -> Result<(), String> {
     let mut map = load_map();
     let before = map.len();
-    map.retain(|k, _| valid_ids.iter().any(|v| v == k));
+    map.retain(|k, _| k.starts_with("app:") || valid_ids.iter().any(|v| v == k));
     if map.len() != before {
         save_map(&map)?;
     }

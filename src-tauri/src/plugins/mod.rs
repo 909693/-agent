@@ -1,5 +1,6 @@
 pub mod mcp;
 pub mod skills;
+pub mod tomato;
 pub mod types;
 pub mod util;
 

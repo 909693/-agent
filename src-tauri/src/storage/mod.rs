@@ -545,6 +545,60 @@ pub fn load_llm_config() -> Result<Option<Value>, String> {
     Ok(Some(val))
 }
 
+/// 番茄发布配置的 secrets 键(app: 保留前缀,见 keyring::prune_keys)。
+const TOMATO_COOKIE_KEY: &str = "app:tomato_cookie";
+const TOMATO_CSRF_KEY: &str = "app:tomato_csrf";
+const SECRET_PLACEHOLDER: &str = "***STORED_IN_KEYCHAIN***";
+
+/// Save Tomato publish config to tomato_config.json (atomic write).
+/// Cookie / CSRF Token 抽出存 .secrets.json,JSON 里不落明文。
+pub fn save_tomato_config(config: &Value) -> Result<(), String> {
+    let dir = app_root_dir();
+    let path = dir.join("tomato_config.json");
+
+    let mut stripped = config.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        for (field, secret_key) in [("cookie", TOMATO_COOKIE_KEY), ("csrfToken", TOMATO_CSRF_KEY)] {
+            if let Some(v) = obj.get(field).and_then(Value::as_str) {
+                // 占位符 / 空值不覆盖已存的 secret
+                if !v.is_empty() && v != SECRET_PLACEHOLDER {
+                    keyring::store_api_key(secret_key, v)?;
+                }
+            }
+            obj.insert(field.to_string(), serde_json::json!(SECRET_PLACEHOLDER));
+        }
+    }
+
+    let content = serde_json::to_string_pretty(&stripped).map_err(|e| e.to_string())?;
+    let tmp_path = dir.join(".tomato_config.json.tmp");
+    fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("重命名文件失败: {}", e)
+    })
+}
+
+/// Load Tomato publish config from tomato_config.json, restoring Cookie / CSRF
+/// from .secrets.json. 未配置时返回 Ok(None)。
+pub fn load_tomato_config() -> Result<Option<Value>, String> {
+    let path = app_root_dir().join("tomato_config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut val: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    if let Some(obj) = val.as_object_mut() {
+        for (field, secret_key) in [("cookie", TOMATO_COOKIE_KEY), ("csrfToken", TOMATO_CSRF_KEY)] {
+            let secret = keyring::get_api_key(secret_key).ok().flatten().unwrap_or_default();
+            obj.insert(field.to_string(), serde_json::json!(secret));
+        }
+    }
+    Ok(Some(val))
+}
+
 /// Save LLM profiles (per-format configs) to llm_profiles.json (atomic write)
 /// API keys within profiles are stored in system keychain, not in the JSON file
 pub fn save_llm_profiles(profiles: &Value) -> Result<(), String> {
