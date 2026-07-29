@@ -15,6 +15,7 @@ import { McpManager } from "./components/McpManager";
 import { OutlineImporter } from "./components/OutlineImporter";
 import { AgentChat } from "./components/AgentChat";
 import { CreateProjectDialog } from "./components/CreateProjectDialog";
+import { TomatoCreateDialog } from "./components/TomatoCreateDialog";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initPromptStore } from "./utils/promptStore";
 import "./App.css";
@@ -36,6 +37,8 @@ function App() {
   const [activeChapter, setActiveChapter] = useState(1);
   const [showOutlineImporter, setShowOutlineImporter] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  // 非空时弹出「在番茄创建新书」弹窗(创建小说时勾选了同步建书)
+  const [tomatoCreateProject, setTomatoCreateProject] = useState<ProjectMeta | null>(null);
   const [agentMessages, setAgentMessages] = useState<Array<{ role: "user" | "assistant" | "tool"; content: string; action?: any; toolName?: string; toolSuccess?: boolean; streaming?: boolean }>>([]);
   const [chatDraft, setChatDraft] = useState<ChatDraft>({
     genre: null,
@@ -124,7 +127,7 @@ function App() {
     setPage("chat");
   };
 
-  const handleProjectCreated = (project: ProjectMeta) => {
+  const handleProjectCreated = (project: ProjectMeta, opts?: { tomato?: boolean }) => {
     setProjects(prev => [project, ...prev]);
     setCurrentProject(project);
     // Reset per-project agent/chat state so the previous project's Agent history
@@ -132,6 +135,7 @@ function App() {
     setAgentMessages([]);
     setChatDraft({ genre: null, messages: [], input: "", frameworkReady: false, error: "" });
     setPage("chapters");
+    if (opts?.tomato) setTomatoCreateProject(project);
   };
 
   const handleSelectProject = (p: ProjectMeta) => {
@@ -255,6 +259,12 @@ function App() {
             <CreateProjectDialog
               onCreated={handleProjectCreated}
               onClose={() => setShowCreateDialog(false)}
+            />
+          )}
+          {tomatoCreateProject && (
+            <TomatoCreateDialog
+              project={tomatoCreateProject}
+              onClose={() => setTomatoCreateProject(null)}
             />
           )}
           <div className={pageShellClass}>

@@ -81,7 +81,18 @@ export interface TomatoConfig {
   cookie: string;        // 番茄作家后台 Cookie
   csrfToken: string;     // X-Secsdk-Csrf-Token
   defaultBookId?: string;
+  defaultThumbUri?: string; // 建书封面 thumb_uri,建过一次后复用
   useAi?: boolean;       // 发布时是否申报「使用 AI 创作」
+}
+
+// 封面生图配置。apiKey 后端落 secrets,JSON 里只存占位符。
+export interface ImageConfig {
+  baseUrl: string;   // 生图 API 站点(OpenAI 兼容),如 https://new-api.abrdns.com
+  apiKey: string;
+  model: string;     // 如 gpt-image-2
+  size?: string;     // 如 1024x1024
+  apiType?: "images" | "chat"; // 接口形态:images=/v1/images/generations,chat=/v1/chat/completions
+  proxyUrl?: string; // 可选代理(如 http://127.0.0.1:7897);GUI 不继承系统代理,需显式配置
 }
 
 export interface CreativeConstraintsPayload {
@@ -394,6 +405,9 @@ export const api = {
     invoke("swap_chapters", { projectId, a, b }),
   getChapter: (projectId: string, chapterNumber: number) =>
     invoke<ChapterData>("get_chapter", { projectId, chapterNumber }),
+  // 一次返回全部已写章节的字数 { "章节号": 字数 },章节管理页用它替代逐章拉全文
+  listChapterStats: (projectId: string) =>
+    invoke<Record<string, number>>("list_chapter_stats", { projectId }),
 
   reviewChapter: (projectId: string, chapterNumber: number, chapterText: string, platform: string, llm: LlmParams, constraints?: CreativeConstraintsPayload) =>
     cancellableInvoke<string>("review_chapter", "review_chapter", { projectId, chapterNumber, chapterText, platform, constraints, ...llmArgs(llm) }),
@@ -500,6 +514,14 @@ export const api = {
   getTomatoConfig: () => invoke<TomatoConfig | null>("get_tomato_config"),
   saveTomatoConfig: (config: TomatoConfig) => invoke("save_tomato_config", { config }),
   tomatoListNovels: () => invoke<string>("tomato_list_novels"),
+  tomatoListCategories: () => invoke<string>("tomato_list_categories"),
+  tomatoCreateBook: (opts: {
+    bookName: string; abstractText: string; thumbUri: string;
+    gender?: "male" | "female"; category?: string; protagonist?: string[];
+  }) => invoke<string>("tomato_create_book", {
+    bookName: opts.bookName, abstractText: opts.abstractText, thumbUri: opts.thumbUri,
+    gender: opts.gender, category: opts.category, protagonist: opts.protagonist,
+  }),
   tomatoPublishChapter: (
     projectId: string, chapterNumber: number,
     opts: { bookId?: string; title: string; publishTime?: string; useAi?: boolean; dryRun?: boolean },
@@ -508,4 +530,11 @@ export const api = {
     bookId: opts.bookId, title: opts.title, publishTime: opts.publishTime,
     useAi: opts.useAi, dryRun: opts.dryRun,
   }),
+
+  // 封面生图
+  getImageConfig: () => invoke<ImageConfig | null>("get_image_config"),
+  saveImageConfig: (config: ImageConfig) => invoke("save_image_config", { config }),
+  // 生成封面并上传番茄,返回 { picUri, picUrl, picData };picUri 即建书 thumb_uri,
+  // picData 是本地 data URL,预览用它绕开番茄 CDN 防盗链。
+  generateCover: (prompt: string) => invoke<{ picUri: string; picUrl: string; picData: string }>("generate_cover", { prompt }),
 };

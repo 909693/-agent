@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, type LlmProvider } from "../api";
+import { api, type LlmProvider, type ImageConfig } from "../api";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -76,9 +76,29 @@ export function SettingsPage({ providers, activeId, onProvidersChange, onActiveC
   const [modelFilter, setModelFilter] = useState("");
   const [modelInput, setModelInput] = useState(""); // 手动输入模型名加入池
 
+  // 封面生图配置
+  const EMPTY_IMAGE_CONFIG: ImageConfig = { baseUrl: "", apiKey: "", model: "", size: "1024x1024", apiType: "images", proxyUrl: "" };
+  const [imageConfig, setImageConfig] = useState<ImageConfig>(EMPTY_IMAGE_CONFIG);
+  const [imageStatus, setImageStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [imageMsg, setImageMsg] = useState("");
+
   useEffect(() => {
     api.getDataDir().then(setDataDir).catch(() => setDataDir("未知"));
+    api.getImageConfig().then((c) => { if (c) setImageConfig({ ...EMPTY_IMAGE_CONFIG, ...c }); }).catch(() => {});
   }, []);
+
+  const handleSaveImageConfig = async () => {
+    setImageMsg("");
+    setImageStatus("saving");
+    try {
+      await api.saveImageConfig(imageConfig);
+      setImageStatus("saved");
+      setTimeout(() => setImageStatus((s) => (s === "saved" ? "idle" : s)), 2500);
+    } catch (e: any) {
+      setImageStatus("idle");
+      setImageMsg("错误：" + String(e));
+    }
+  };
 
   const startAdd = () => {
     setDraft({ id: "", name: "", apiFormat: "openai", apiKey: "", model: "", models: [], baseUrl: "", proxyUrl: "", userAgent: "" });
@@ -470,6 +490,79 @@ export function SettingsPage({ providers, activeId, onProvidersChange, onActiveC
           </div>
         </div>
       )}
+
+      <div className="settings-card">
+        <h3>封面生图</h3>
+        <div className="form-hint" style={{ marginBottom: 12 }}>
+          配置一个 OpenAI 兼容的生图模型（如 New API 站的 gpt-image-2）。建书时可一键用书名/简介生成封面，自动上传番茄换取 thumb_uri。
+        </div>
+        <div className="form-group">
+          <label>API 地址</label>
+          <input
+            value={imageConfig.baseUrl}
+            onChange={e => setImageConfig({ ...imageConfig, baseUrl: e.target.value })}
+            placeholder="https://new-api.abrdns.com"
+          />
+        </div>
+        <div className="form-group">
+          <label>API Key</label>
+          <input
+            type="password"
+            value={imageConfig.apiKey}
+            onChange={e => setImageConfig({ ...imageConfig, apiKey: e.target.value })}
+            placeholder="sk-..."
+          />
+        </div>
+        <div className="form-group">
+          <label>模型名</label>
+          <input
+            value={imageConfig.model}
+            onChange={e => setImageConfig({ ...imageConfig, model: e.target.value })}
+            placeholder="gpt-image-2"
+          />
+        </div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          <div className="form-group" style={{ flex: 1, minWidth: 160 }}>
+            <label>接口类型</label>
+            <select
+              value={imageConfig.apiType || "images"}
+              onChange={e => setImageConfig({ ...imageConfig, apiType: e.target.value as "images" | "chat" })}
+            >
+              <option value="images">images（/v1/images/generations）</option>
+              <option value="chat">chat（/v1/chat/completions）</option>
+            </select>
+          </div>
+          <div className="form-group" style={{ flex: 1, minWidth: 160 }}>
+            <label>图片尺寸</label>
+            <input
+              value={imageConfig.size || ""}
+              onChange={e => setImageConfig({ ...imageConfig, size: e.target.value })}
+              placeholder="1024x1024"
+            />
+          </div>
+        </div>
+        <div className="form-group">
+          <label>代理地址（可选）</label>
+          <input
+            value={imageConfig.proxyUrl || ""}
+            onChange={e => setImageConfig({ ...imageConfig, proxyUrl: e.target.value })}
+            placeholder="http://127.0.0.1:7897"
+          />
+          <small style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 4, display: "block" }}>
+            桌面应用不会自动走系统代理。若生图站需科学上网（如连接超时 os error 60），在此填本地代理端口，与 Cherry 等客户端的代理一致。
+          </small>
+        </div>
+        <div className="form-hint" style={{ marginBottom: 12 }}>
+          接口类型按生图站要求选：gpt-image-2 在部分中转站走 chat completions；多数生图模型走 images。拿不准先试 images，报错再换 chat。
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button className="btn-primary" onClick={handleSaveImageConfig} disabled={imageStatus === "saving"}>
+            {imageStatus === "saving" ? "保存中..." : "保存生图配置"}
+          </button>
+          {imageStatus === "saved" && <span className="saved-tag">✓ 已保存（Key 加密落盘）</span>}
+        </div>
+        {imageMsg && <div className="data-dir-msg error" style={{ marginTop: 8 }}>{imageMsg}</div>}
+      </div>
 
       <div className="settings-card">
         <h3>数据存储</h3>

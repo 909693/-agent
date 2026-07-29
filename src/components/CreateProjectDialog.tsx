@@ -3,7 +3,7 @@ import { api } from "../api";
 
 interface Props {
   onClose: () => void;
-  onCreated: (project: any) => void;
+  onCreated: (project: any, opts?: { tomato?: boolean }) => void;
 }
 
 export function CreateProjectDialog({ onClose, onCreated }: Props) {
@@ -16,7 +16,7 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (tomato = false) => {
     if (!title.trim() || !premise.trim()) {
       setError("请填写标题和故事前提");
       return;
@@ -36,7 +36,7 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
         targetChapterWords: safeTargetWords,
       });
 
-      onCreated(project);
+      onCreated(project, { tomato });
       onClose();
     } catch (e: any) {
       setError(e.toString());
@@ -128,7 +128,10 @@ export function CreateProjectDialog({ onClose, onCreated }: Props) {
           <button className="btn-outline" onClick={onClose} disabled={loading}>
             取消
           </button>
-          <button className="btn-primary" onClick={handleSubmit} disabled={loading}>
+          <button className="btn-outline" onClick={() => handleSubmit(true)} disabled={loading} title="本地创建后打开番茄建书弹窗，同步在番茄作家后台建这本书">
+            {loading ? "创建中..." : "创建并在番茄建书"}
+          </button>
+          <button className="btn-primary" onClick={() => handleSubmit()} disabled={loading}>
             {loading ? "创建中..." : "创建小说"}
           </button>
         </div>

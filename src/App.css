@@ -3166,3 +3166,14 @@ body {
   padding: 0;
   gap: 0;
 }
+
+/* ===== 长列表滚动性能 ===== */
+/* .btn-sm 等胶囊按钮全局带 backdrop-filter(液态玻璃),章节列表几百行、
+   每行 4-5 个按钮时就是上千个实时模糊合成层,WKWebView 滚动直接掉帧。
+   表格底色本就是实底,按钮模糊无视觉差,整表退化为无模糊。 */
+.chapter-table .btn-sm,
+.chapter-table .move-btn,
+.chapter-table button {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}

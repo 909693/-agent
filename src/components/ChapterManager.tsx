@@ -34,7 +34,9 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
   const [plot, setPlot] = useState<any>(null);
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
-  const [chapterTexts, setChapterTexts] = useState<Record<number, string>>({});
+  // 各章字数 { 章节号: 字数 }(只含已写章节)。只存字数不存全文:
+  // 章节列表只需要「字数/已写」,逐章拉全文会导致进入本页明显卡顿。
+  const [chapterWords, setChapterWords] = useState<Record<number, number>>({});
   const [showExport, setShowExport] = useState(false);
   const [publishTarget, setPublishTarget] = useState<{ number: number; title: string } | null>(null);
   const [outlineText, setOutlineText] = useState("");
@@ -84,10 +86,8 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     api.getCharacters(project.id).then(setCharacters).catch(() => setCharacters(null));
     api.getChapterSummaries(project.id).then(setSummaries).catch(() => setSummaries(null));
     api.getStyleProfile(project.id).then(setStyleProfile).catch(() => setStyleProfile(null));
-    api.getPlot(project.id).then(p => {
-      setPlot(p);
-      loadChapterTexts(p);
-    }).catch(() => setPlot(null));
+    api.getPlot(project.id).then(setPlot).catch(() => setPlot(null));
+    loadChapterStats();
     api.getOutlineSource(project.id).then((d) => {
       setOutlineText(d?.text || "");
       setOutlineName(d?.name || "");
@@ -105,13 +105,13 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     return () => { cancelledLocal = true; if (unlisten) unlisten(); };
   }, []);
 
-  // Reload chapter texts when a batch for THIS project finishes.
+  // Reload chapter stats when a batch for THIS project finishes.
   useEffect(() => {
-    if (prevBatchRunningRef.current && !batchRunning && isThisProject && plot) {
-      loadChapterTexts(plot);
+    if (prevBatchRunningRef.current && !batchRunning && isThisProject) {
+      loadChapterStats();
     }
     prevBatchRunningRef.current = batchRunning;
-  }, [batchRunning, isThisProject, plot]);
+  }, [batchRunning, isThisProject]);
 
   // Surface controller-reported batch errors through the shared error banner.
   useEffect(() => {
@@ -126,31 +126,23 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       for (const ch of act.chapters || []) chapters.push(ch.number);
     }
     if (chapters.length > 0) {
-      const firstUnwritten = chapters.find(n => !chapterTexts[n]);
+      const firstUnwritten = chapters.find(n => !chapterWords[n]);
       setBatchStart(firstUnwritten ?? chapters[0]);
       setBatchEnd(chapters[chapters.length - 1]);
     }
-  }, [plot, chapterTexts]);
-  const loadChapterTexts = async (plotData: any) => {
-    if (!plotData?.acts) return;
-    const allChapterNums: number[] = [];
-    for (const act of plotData.acts) {
-      for (const ch of act.chapters || []) allChapterNums.push(ch.number);
-    }
-    // Load chapters in parallel instead of serial waterfall
-    const results = await Promise.allSettled(
-      allChapterNums.map(async (num) => {
-        const d: any = await api.getChapter(project.id, num);
-        return { num, text: d.text || "" };
-      })
-    );
-    const texts: Record<number, string> = {};
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value.text) {
-        texts[r.value.num] = r.value.text;
+  }, [plot, chapterWords]);
+  const loadChapterStats = async () => {
+    try {
+      const stats = await api.listChapterStats(project.id);
+      const words: Record<number, number> = {};
+      for (const [k, v] of Object.entries(stats || {})) {
+        const n = Number(k);
+        if (n > 0 && Number(v) > 0) words[n] = Number(v);
       }
+      setChapterWords(words);
+    } catch {
+      setChapterWords({});
     }
-    setChapterTexts(texts);
   };
 
   const saveOutline = async (text: string, name = "手动导入大纲") => {
@@ -163,7 +155,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
     if (parsedPlot.acts.length > 0) {
       await api.savePlotOutline(project.id, parsedPlot);
       setPlot(parsedPlot);
-      loadChapterTexts(parsedPlot);
+      loadChapterStats();
     }
 
     // Only bootstrap world/characters from the outline skeleton when none exist
@@ -243,7 +235,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       const payload = await buildCreativeConstraintsPayload(project.genre);
       const p = await api.generatePlot(project.id, llm, payload, targetChapters);
       setPlot(p);
-      loadChapterTexts(p);
+      loadChapterStats();
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(""); setPlotProgress(null); }
   };
@@ -259,7 +251,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       setLoading("plot"); setPlotProgress(null);
       const p = await api.generatePlot(project.id, llm, payload, targetChapters);
       setPlot(p);
-      loadChapterTexts(p);
+      loadChapterStats();
     } catch (e: any) { setError(e.toString()); }
     finally { setLoading(""); setPlotProgress(null); }
   };
@@ -399,7 +391,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       // content (text/summaries are number-keyed and would otherwise desync).
       await api.swapChapters(project.id, numG, numS);
       setPlot(newPlot);
-      loadChapterTexts(newPlot);
+      loadChapterStats();
       api.getChapterSummaries(project.id).then(setSummaries).catch(() => {});
     } catch (e: any) { setError(e.toString()); }
   };
@@ -419,7 +411,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
 
   const handleSummarizeAll = async () => {
     const chaptersToSummarize = allChapters.filter(ch => {
-      const written = (chapterTexts[ch.number] || "").length > 0;
+      const written = (chapterWords[ch.number] || 0) > 0;
       const hasSummary = summaries?.[String(ch.number)];
       return written && !hasSummary;
     });
@@ -856,8 +848,7 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
               </thead>
               <tbody>
                 {allChapters.map((ch, idx) => {
-                  const text = chapterTexts[ch.number] || "";
-                  const wc = text.length;
+                  const wc = chapterWords[ch.number] || 0;
                   const written = wc > 0;
                   const batchStatus = chapterStatuses[ch.number];
                   return (
@@ -1096,10 +1087,10 @@ export function ChapterManager({ project, llm, onWriteChapter }: Props) {
       )}
       {publishTarget && (
         <PublishDialog
-          projectId={project.id}
+          project={project}
           chapterNumber={publishTarget.number}
           chapterTitle={publishTarget.title}
-          chapterWords={(chapterTexts[publishTarget.number] || "").length}
+          chapterWords={chapterWords[publishTarget.number] || 0}
           onClose={() => setPublishTarget(null)}
         />
       )}

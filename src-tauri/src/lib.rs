@@ -1491,6 +1491,37 @@ async fn tomato_list_novels() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn tomato_list_categories() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(plugins::tomato::list_categories)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 在番茄创建新书。abstract 是 Rust 保留字,参数名用 abstract_text(前端传 abstractText)。
+#[tauri::command]
+async fn tomato_create_book(
+    book_name: String,
+    abstract_text: String,
+    thumb_uri: String,
+    gender: Option<String>,
+    category: Option<String>,
+    protagonist: Option<Vec<String>>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        plugins::tomato::create_book(
+            &book_name,
+            &abstract_text,
+            &thumb_uri,
+            gender,
+            category,
+            protagonist.unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn tomato_publish_chapter(
     project_id: String,
     chapter_number: u32,
@@ -1513,6 +1544,33 @@ async fn tomato_publish_chapter(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ===== 封面生图 =====
+
+#[tauri::command]
+async fn get_image_config() -> Result<Value, String> {
+    Ok(storage::load_image_config()?.unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+async fn save_image_config(config: Value) -> Result<(), String> {
+    storage::save_image_config(&config)
+}
+
+/// 用生图模型生成一张封面,上传到番茄,返回 { picUri, picUrl }。
+/// picUri 即建书所需的 thumb_uri。
+#[tauri::command]
+async fn generate_cover(prompt: String) -> Result<Value, String> {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("生图提示词不能为空".into());
+    }
+    let (bytes, content_type) = plugins::cover::generate_image_bytes(&prompt).await?;
+    // 预览用本地 data URL(绕开番茄 CDN 防盗链);字节随后 move 进上传,故先编码。
+    let pic_data = plugins::cover::to_data_url(&bytes, &content_type);
+    let (pic_uri, pic_url) = plugins::tomato::upload_cover(bytes, content_type).await?;
+    Ok(json!({ "picUri": pic_uri, "picUrl": pic_url, "picData": pic_data }))
 }
 
 fn make_client(api_format: &str, api_key: &str, model: &str, base_url: &str, proxy_url: Option<String>, user_agent: Option<String>) -> LlmClient {
@@ -2209,6 +2267,14 @@ async fn get_chapter(project_id: String, chapter_number: u32) -> Result<Value, S
 
     let chapter_file = format!("chapter_{:03}.json", chapter_number);
     storage::load_json(&project_id, &chapter_file)?.ok_or_else(|| "Chapter not found".into())
+}
+
+/// 章节管理页用:一次返回全部已写章节的字数,替代逐章 get_chapter 全文拉取。
+#[tauri::command]
+async fn list_chapter_stats(project_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || storage::list_chapter_stats(&project_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3331,6 +3397,7 @@ pub fn run() {
             save_chapter,
             swap_chapters,
             get_chapter,
+            list_chapter_stats,
             rewrite_selection,
             review_chapter,
             summarize_chapter,
@@ -3367,7 +3434,12 @@ pub fn run() {
             get_tomato_config,
             save_tomato_config,
             tomato_list_novels,
+            tomato_list_categories,
+            tomato_create_book,
             tomato_publish_chapter,
+            get_image_config,
+            save_image_config,
+            generate_cover,
         ])
         .setup(|_app| {
             // Register cleanup handler for MCP servers on app exit

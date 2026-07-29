@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type TomatoConfig } from "../api";
+import { api, type ProjectMeta, type TomatoConfig } from "../api";
+import { TomatoCreateDialog } from "./TomatoCreateDialog";
 
 interface Props {
-  projectId: string;
+  project: ProjectMeta;
   chapterNumber: number;
   chapterTitle: string;
   chapterWords: number;
@@ -33,7 +34,7 @@ function parseNovels(raw: string): NovelOption[] {
   return out;
 }
 
-export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterWords, onClose }: Props) {
+export function PublishDialog({ project, chapterNumber, chapterTitle, chapterWords, onClose }: Props) {
   // 大纲标题一般不带「第N章」前缀,带了就不重复拼
   const defaultTitle = /^第.{1,6}[章回]/.test(chapterTitle)
     ? chapterTitle
@@ -58,6 +59,9 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
   const [result, setResult] = useState("");
   const [published, setPublished] = useState(false);
   const [error, setError] = useState("");
+  // 「新建书」子弹窗:发布目标里没有这本书时,不用离开发布流程直接建
+  const [showCreate, setShowCreate] = useState(false);
+  const createdIdRef = useRef("");
   const armTimer = useRef<number | null>(null);
   const resultEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -127,7 +131,7 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
     setResult("");
     setBusy(dryRun ? "preview" : "publish");
     try {
-      const text = await api.tomatoPublishChapter(projectId, chapterNumber, {
+      const text = await api.tomatoPublishChapter(project.id, chapterNumber, {
         bookId: bookId || undefined,
         title: title.trim(),
         publishTime: publishTime ? publishTime.replace("T", " ") : undefined,
@@ -155,6 +159,16 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
     }
     disarm();
     void doPublish(false);
+  };
+
+  // 新建书弹窗关闭:若建成,刷新书目并选中新书
+  const handleCreateClosed = async () => {
+    setShowCreate(false);
+    const id = createdIdRef.current;
+    if (!id) return;
+    await handleLoadNovels();
+    setBookId(id);
+    disarm();
   };
 
   const labelStyle = { fontSize: 13, color: "var(--text-secondary)", marginBottom: 4 } as const;
@@ -223,6 +237,10 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               {novels.length > 0 ? (
                 <select style={{ ...inputStyle, flex: 1 }} value={bookId} onChange={(e) => { setBookId(e.target.value); disarm(); }}>
+                  {/* 刚新建、列表尚未包含的书,补一个可选项避免显示错位 */}
+                  {bookId && !novels.some((n) => n.bookId === bookId) && (
+                    <option value={bookId}>（新建）{bookId}</option>
+                  )}
                   {novels.map((n) => (
                     <option key={n.bookId} value={n.bookId}>《{n.name}》（{n.bookId}）</option>
                   ))}
@@ -233,6 +251,10 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
               )}
               <button className="btn-outline" onClick={handleLoadNovels} disabled={loadingNovels || !configLoaded}>
                 {loadingNovels ? <><span className="loading-spinner" />加载中</> : novels.length > 0 ? "刷新书目" : "加载书目"}
+              </button>
+              <button className="btn-outline" onClick={() => setShowCreate(true)} disabled={!configLoaded}
+                title="账号里还没有这本书?用本书的标题/简介在番茄新建,建成后自动选中">
+                新建书
               </button>
             </div>
             {novelsRaw && novels.length > 0 && (
@@ -291,6 +313,13 @@ export function PublishDialog({ projectId, chapterNumber, chapterTitle, chapterW
             </>
           )}
         </div>
+        {showCreate && (
+          <TomatoCreateDialog
+            project={project}
+            onCreated={(id) => { createdIdRef.current = id; }}
+            onClose={() => { void handleCreateClosed(); }}
+          />
+        )}
       </div>
     </div>
   );

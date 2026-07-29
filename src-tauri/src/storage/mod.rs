@@ -328,6 +328,37 @@ pub fn load_json(project_id: &str, filename: &str) -> Result<Option<Value>, Stri
     Ok(Some(val))
 }
 
+/// 一次性统计项目下所有章节的字数,返回 { "章节号": 字数 }(只含已写章节)。
+/// 章节管理页只需要字数/已写状态,用这一次调用替代前端逐章全文拉取。
+pub fn list_chapter_stats(project_id: &str) -> Result<Value, String> {
+    let dir = project_dir(project_id);
+    let mut stats = serde_json::Map::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Value::Object(stats)), // 目录不存在视为无章节
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // 只认 chapter_NNN.json(3-4 位数字,对应章节号 1-9999)
+        let Some(num) = name
+            .strip_prefix("chapter_")
+            .and_then(|s| s.strip_suffix(".json"))
+            .filter(|s| (3..=4).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let Ok(chapter_number) = num.parse::<u32>() else { continue };
+        let Ok(content) = fs::read_to_string(entry.path()) else { continue };
+        let Ok(val) = serde_json::from_str::<Value>(&content) else { continue };
+        let words = val["text"].as_str().map(|t| t.chars().count()).unwrap_or(0);
+        if words > 0 {
+            stats.insert(chapter_number.to_string(), serde_json::json!(words));
+        }
+    }
+    Ok(Value::Object(stats))
+}
+
 pub fn list_projects() -> Result<Vec<Value>, String> {
     let dir = data_dir();
     let mut projects = Vec::new();
@@ -599,7 +630,50 @@ pub fn load_tomato_config() -> Result<Option<Value>, String> {
     Ok(Some(val))
 }
 
-/// Save LLM profiles (per-format configs) to llm_profiles.json (atomic write)
+/// 封面生图配置的 secret 键(apiKey 存 keychain,JSON 里只留占位符)。
+const IMAGE_API_KEY_KEY: &str = "app:image_api_key";
+
+/// Save 封面生图配置到 image_config.json(atomic write)。apiKey 抽出存 secrets。
+pub fn save_image_config(config: &Value) -> Result<(), String> {
+    let dir = app_root_dir();
+    let path = dir.join("image_config.json");
+
+    let mut stripped = config.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        if let Some(v) = obj.get("apiKey").and_then(Value::as_str) {
+            if !v.is_empty() && v != SECRET_PLACEHOLDER {
+                keyring::store_api_key(IMAGE_API_KEY_KEY, v)?;
+            }
+        }
+        obj.insert("apiKey".to_string(), serde_json::json!(SECRET_PLACEHOLDER));
+    }
+
+    let content = serde_json::to_string_pretty(&stripped).map_err(|e| e.to_string())?;
+    let tmp_path = dir.join(".image_config.json.tmp");
+    fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("重命名文件失败: {}", e)
+    })
+}
+
+/// Load 封面生图配置,apiKey 从 secrets 还原。未配置返回 Ok(None)。
+pub fn load_image_config() -> Result<Option<Value>, String> {
+    let path = app_root_dir().join("image_config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut val: Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    if let Some(obj) = val.as_object_mut() {
+        let secret = keyring::get_api_key(IMAGE_API_KEY_KEY).ok().flatten().unwrap_or_default();
+        obj.insert("apiKey".to_string(), serde_json::json!(secret));
+    }
+    Ok(Some(val))
+}
 /// API keys within profiles are stored in system keychain, not in the JSON file
 pub fn save_llm_profiles(profiles: &Value) -> Result<(), String> {
     let dir = app_root_dir();
