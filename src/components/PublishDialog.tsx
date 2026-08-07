@@ -51,7 +51,11 @@ export function PublishDialog({ project, chapterNumber, chapterTitle, chapterWor
 
   const [bookId, setBookId] = useState("");
   const [title, setTitle] = useState(defaultTitle);
-  const [publishTime, setPublishTime] = useState("");
+  const [pubDate, setPubDate] = useState("");
+  const [pubTime, setPubTime] = useState("");
+  // 填了日期即视为定时;时间留空兜底当天 00:00。只填时间不填日期无意义,走立即发布
+  const publishTime = pubDate ? `${pubDate} ${pubTime || "00:00"}` : "";
+  const clearSchedule = () => { setPubDate(""); setPubTime(""); disarm(); };
   const [useAi, setUseAi] = useState(true);
 
   const [busy, setBusy] = useState<"" | "preview" | "publish">("");
@@ -134,7 +138,7 @@ export function PublishDialog({ project, chapterNumber, chapterTitle, chapterWor
       const text = await api.tomatoPublishChapter(project.id, chapterNumber, {
         bookId: bookId || undefined,
         title: title.trim(),
-        publishTime: publishTime ? publishTime.replace("T", " ") : undefined,
+        publishTime: publishTime || undefined,
         useAi,
         dryRun,
       });
@@ -271,11 +275,13 @@ export function PublishDialog({ project, chapterNumber, chapterTitle, chapterWor
           {/* 定时与 AI 申报 */}
           <div style={{ display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 14 }}>
             <div>
-              <div style={labelStyle}>定时发布（留空立即发布）</div>
+              <div style={labelStyle}>定时发布（填日期即生效，时间留空默认当天 00:00；全留空立即发布）</div>
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <input type="datetime-local" style={inputStyle} value={publishTime}
-                  onChange={(e) => { setPublishTime(e.target.value); disarm(); }} />
-                {publishTime && <button className="btn-sm" onClick={() => { setPublishTime(""); disarm(); }}>清除</button>}
+                <input type="date" style={{ ...inputStyle, width: "auto" }} value={pubDate}
+                  onChange={(e) => { setPubDate(e.target.value); disarm(); }} />
+                <input type="time" style={{ ...inputStyle, width: "auto" }} value={pubTime}
+                  onChange={(e) => { setPubTime(e.target.value); disarm(); }} />
+                {(pubDate || pubTime) && <button className="btn-sm" onClick={clearSchedule}>清除</button>}
               </div>
             </div>
             <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, cursor: "pointer", paddingBottom: 8 }}>
